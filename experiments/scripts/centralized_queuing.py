@@ -30,9 +30,9 @@ from experiments.scripts.options import Scheduler
 from experiments.scripts.run import Experiment
 from experiments.scripts.run import Run
 
-_NUM_CPUS = 8
+_NUM_CPUS = 6
 _NUM_CFS_WORKERS = _NUM_CPUS - 2
-_NUM_GHOST_WORKERS = 11
+_NUM_GHOST_WORKERS = 6
 
 
 def RunCfs():
