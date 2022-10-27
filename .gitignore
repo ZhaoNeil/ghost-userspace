@@ -1,4 +1,4 @@
-./bazel-bin/
-./bazel-ghost-userspace/
-./bazel-out/
-./bazel-testlogs/
+/bazel-bin
+/bazel-ghost-userspace
+/bazel-out
+/bazel-testlogs
