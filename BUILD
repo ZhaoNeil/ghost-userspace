@@ -80,10 +80,11 @@ cc_binary(
     deps = [
         ":agent",
         ":base",
-        ":shared",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
 )
@@ -313,8 +314,6 @@ cc_library(
     copts = compiler_flags,
     deps = [
         ":agent",
-        ":ghost",
-        ":shared",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:bind_front",
         "@com_google_absl//absl/strings:str_format",
@@ -335,17 +334,26 @@ cc_test(
     ],
 )
 
+bpf_skeleton(
+    name = "test_bpf_skel",
+    bpf_object = "//third_party/bpf:test_bpf",
+    skel_hdr = "bpf/user/test_bpf.skel.h",
+)
+
 cc_test(
     name = "capabilities_test",
     size = "small",
     srcs = [
+        "bpf/user/test_bpf.skel.h",
         "tests/capabilities_test.cc",
     ],
     copts = compiler_flags,
+    linkopts = bpf_linkopts,
     deps = [
         ":agent",
         ":capabilities_test_lib",
         ":ghost",
+        "@linux//:libbpf",
     ],
 )
 
