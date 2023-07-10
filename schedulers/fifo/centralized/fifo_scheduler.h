@@ -1,24 +1,15 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_SCHEDULERS_FIFO_CENTRALIZED_FIFO_SCHEDULER_H
 #define GHOST_SCHEDULERS_FIFO_CENTRALIZED_FIFO_SCHEDULER_H
 
 #include <cstdint>
 #include <map>
+#include <memory>
 
 #include "absl/time/time.h"
 #include "lib/agent.h"
@@ -58,18 +49,12 @@ struct FifoTask : public Task<> {
         return "OnCpu";
       case FifoTask::RunState::kYielding:
         return "Yielding";
-        // We will get a compile error if a new member is added to the
-        // `FifoTask::RunState` enum and a corresponding case is not added
-        // here.
     }
-    CHECK(false);
-    return "Unknown run state";
   }
 
   friend std::ostream& operator<<(std::ostream& os,
                                   FifoTask::RunState run_state) {
-    os << RunStateToString(run_state);
-    return os;
+    return os << RunStateToString(run_state);
   }
 
   RunState run_state = RunState::kBlocked;
@@ -84,7 +69,7 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
  public:
   FifoScheduler(Enclave* enclave, CpuList cpulist,
                 std::shared_ptr<TaskAllocator<FifoTask>> allocator,
-                int32_t global_cpu);
+                int32_t global_cpu, absl::Duration preemption_time_slice);
   ~FifoScheduler();
 
   void EnclaveReady();
@@ -107,17 +92,11 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
 
   bool Empty() { return num_tasks_ == 0; }
 
-  // We validate state is consistent before actually tearing anything down since
-  // tear-down involves pings and agents potentially becoming non-coherent as
-  // they are removed sequentially.
-  void ValidatePreExitState();
-
   // Removes 'task' from the runqueue.
   void RemoveFromRunqueue(FifoTask* task);
 
   // Main scheduling function for the global agent.
-  void GlobalSchedule(const StatusWord& agent_sw,
-                      StatusWord::BarrierToken agent_sw_last);
+  void GlobalSchedule(const StatusWord& agent_sw, BarrierToken agent_sw_last);
 
   int32_t GetGlobalCPUId() {
     return global_cpu_.load(std::memory_order_acquire);
@@ -132,8 +111,7 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   // global agent's CPU, the global agent calls this function to try to pick a
   // new CPU to move to and, if a new CPU is found, to initiate the handoff
   // process.
-  bool PickNextGlobalCPU(StatusWord::BarrierToken agent_barrier,
-                         const Cpu& this_cpu);
+  bool PickNextGlobalCPU(BarrierToken agent_barrier, const Cpu& this_cpu);
 
   // Print debug details about the current tasks managed by the global agent,
   // CPU state, and runqueue stats.
@@ -146,6 +124,7 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   struct CpuState {
     FifoTask* current = nullptr;
     const Agent* agent = nullptr;
+    absl::Time last_commit;
   } ABSL_CACHELINE_ALIGNED;
 
   // Updates the state of `task` to reflect that it is now running on `cpu`.
@@ -155,6 +134,9 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
 
   // Marks a task as yielded.
   void Yield(FifoTask* task);
+  // Takes the task out of the yielding_tasks_ runqueue and puts it back into
+  // the global runqueue.
+  void Unyield(FifoTask* task);
 
   // Adds a task to the FIFO runqueue.
   void Enqueue(FifoTask* task);
@@ -186,6 +168,8 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   LocalChannel global_channel_;
   int num_tasks_ = 0;
 
+  const absl::Duration preemption_time_slice_;
+
   std::deque<FifoTask*> run_queue_;
   std::vector<FifoTask*> yielding_tasks_;
 
@@ -195,9 +179,9 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
 };
 
 // Initializes the task allocator and the FIFO scheduler.
-std::unique_ptr<FifoScheduler> SingleThreadFifoScheduler(Enclave* enclave,
-                                                         CpuList cpulist,
-                                                         int32_t global_cpu);
+std::unique_ptr<FifoScheduler> SingleThreadFifoScheduler(
+    Enclave* enclave, CpuList cpulist, int32_t global_cpu,
+    absl::Duration preemption_time_slice);
 
 // Operates as the Global or Satellite agent depending on input from the
 // global_scheduler->GetGlobalCPU callback.
@@ -216,10 +200,14 @@ class FifoAgent : public LocalAgent {
 class FifoConfig : public AgentConfig {
  public:
   FifoConfig() {}
-  FifoConfig(Topology* topology, CpuList cpulist, Cpu global_cpu)
-      : AgentConfig(topology, std::move(cpulist)), global_cpu_(global_cpu) {}
+  FifoConfig(Topology* topology, CpuList cpulist, Cpu global_cpu,
+             absl::Duration preemption_time_slice)
+      : AgentConfig(topology, std::move(cpulist)),
+        global_cpu_(global_cpu),
+        preemption_time_slice_(preemption_time_slice) {}
 
   Cpu global_cpu_{Cpu::UninitializedType::kUninitialized};
+  absl::Duration preemption_time_slice_ = absl::InfiniteDuration();
 };
 
 // A global agent scheduler. It runs a single-threaded FIFO scheduler on the
@@ -229,14 +217,13 @@ class FullFifoAgent : public FullAgent<EnclaveType> {
  public:
   explicit FullFifoAgent(FifoConfig config) : FullAgent<EnclaveType>(config) {
     global_scheduler_ = SingleThreadFifoScheduler(
-        &this->enclave_, *this->enclave_.cpus(), config.global_cpu_.id());
+        &this->enclave_, *this->enclave_.cpus(), config.global_cpu_.id(),
+        config.preemption_time_slice_);
     this->StartAgentTasks();
     this->enclave_.Ready();
   }
 
   ~FullFifoAgent() override {
-    global_scheduler_->ValidatePreExitState();
-
     // Terminate global agent before satellites to avoid a false negative error
     // from ghost_run(). e.g. when the global agent tries to schedule on a CPU
     // without an active satellite agent.
@@ -259,8 +246,8 @@ class FullFifoAgent : public FullAgent<EnclaveType> {
   }
 
   std::unique_ptr<Agent> MakeAgent(const Cpu& cpu) override {
-    return absl::make_unique<FifoAgent>(&this->enclave_, cpu,
-                                        global_scheduler_.get());
+    return std::make_unique<FifoAgent>(&this->enclave_, cpu,
+                                       global_scheduler_.get());
   }
 
   void RpcHandler(int64_t req, const AgentRpcArgs& args,

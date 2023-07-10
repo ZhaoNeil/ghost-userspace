@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "experiments/antagonist/cfs_orchestrator.h"
 
@@ -31,7 +23,7 @@ void CfsOrchestrator::InitThreadPool() {
 
 CfsOrchestrator::CfsOrchestrator(Orchestrator::Options opts)
     : Orchestrator(std::move(opts)), threads_ready_(options().num_threads + 1) {
-  CHECK_EQ(options().num_threads, options().cpus.size());
+  CHECK_EQ(options().num_threads, options().cpus.Size());
 
   InitThreadPool();
   threads_ready_.Block();
@@ -41,11 +33,13 @@ CfsOrchestrator::CfsOrchestrator(Orchestrator::Options opts)
 void CfsOrchestrator::Worker(uint32_t sid) {
   if (!thread_triggers().Triggered(sid)) {
     thread_triggers().Trigger(sid);
-    CHECK_ZERO(ghost::Ghost::SchedSetAffinity(
-        ghost::Gtid::Current(), ghost::MachineTopology()->ToCpuList(
-                                    std::vector<int>{options().cpus[sid]})));
+    const ghost::Cpu cpu = options().cpus.GetNthCpu(sid);
+    CHECK_EQ(
+        ghost::GhostHelper()->SchedSetAffinity(
+            ghost::Gtid::Current(), ghost::MachineTopology()->ToCpuList({cpu})),
+        0);
     printf("Worker (SID %u, TID: %ld, affined to CPU %u)\n", sid,
-           syscall(SYS_gettid), options().cpus[sid]);
+           syscall(SYS_gettid), cpu.id());
     threads_ready_.Block();
   }
 

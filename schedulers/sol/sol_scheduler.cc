@@ -1,18 +1,12 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/sol/sol_scheduler.h"
+
+#include <memory>
 
 #include "absl/strings/str_format.h"
 
@@ -24,10 +18,13 @@ void SolScheduler::CpuTimerExpired(const Message& msg) { CHECK(0); }
 
 SolScheduler::SolScheduler(Enclave* enclave, CpuList cpulist,
                            std::shared_ptr<TaskAllocator<SolTask>> allocator,
-                           int32_t global_cpu)
+                           int32_t global_cpu,
+                           int32_t numa_node,
+                           absl::Duration preemption_time_slice)
     : BasicDispatchScheduler(enclave, std::move(cpulist), std::move(allocator)),
       global_cpu_(global_cpu),
-      global_channel_(GHOST_MAX_QUEUE_ELEMS, /*node=*/0) {
+      global_channel_(GHOST_MAX_QUEUE_ELEMS, numa_node),
+      preemption_time_slice_(preemption_time_slice) {
   if (!cpus().IsSet(global_cpu_)) {
     Cpu c = cpus().Front();
     CHECK(c.valid());
@@ -53,9 +50,26 @@ bool SolScheduler::Available(const Cpu& cpu) {
   return false;
 }
 
-void SolScheduler::ValidatePreExitState() {
-  CHECK_EQ(num_tasks_, 0);
-  CHECK_EQ(RunqueueSize(), 0);
+void SolScheduler::DumpStats() {
+  fprintf(stderr, "\n------------------------------------------------\n");
+
+  float t_d = absl::ToDoubleMicroseconds(dispatch_durations_total_) /
+                iterations_;
+  float t_t = absl::ToDoubleMicroseconds(schedule_durations_total_) /
+                iterations_;
+  float t_a = t_t - t_d;
+  float msg_per_iter = 1.0 * nr_msgs_ / iterations_;
+  float A = msg_per_iter / t_t;
+
+  fprintf(stderr, "global iterations: %lu, nr_msgs %lu, msg/iter %.2f, "
+          "total msg rate (A) %.2f\n",
+          iterations_, nr_msgs_, msg_per_iter, A);
+  fprintf(stderr, "T_d: %.2f, T_a: %.2f, T_t: %.2f\n", t_d, t_a, t_t);
+  fprintf(stderr,
+          "A/S = T_d/T_t: %.2f, Computed S: %.2f, L: %.2f\n",
+          t_d / t_t, A * t_t / t_d, t_a * A);
+
+  fprintf(stderr, "------------------------------------------------\n");
 }
 
 void SolScheduler::DumpAllTasks() {
@@ -100,6 +114,20 @@ SolScheduler::CpuState* SolScheduler::cpu_state_of(const SolTask* task) {
   return cs;
 }
 
+void SolScheduler::TaskOffCpu(SolTask* task, bool blocked, bool from_switchto) {
+  if (task->oncpu()) {
+    CpuState* cs = cpu_state_of(task);
+    CHECK_EQ(cs->current, task);
+    cs->current = nullptr;
+  } else {
+    CHECK(from_switchto);
+    CHECK(task->blocked());
+  }
+
+  task->run_state =
+      blocked ? SolTask::RunState::kBlocked : SolTask::RunState::kRunnable;
+}
+
 void SolScheduler::TaskNew(SolTask* task, const Message& msg) {
   const ghost_msg_payload_task_new* payload =
       static_cast<const ghost_msg_payload_task_new*>(msg.payload());
@@ -128,6 +156,10 @@ void SolScheduler::TaskRunnable(SolTask* task, const Message& msg) {
 }
 
 void SolScheduler::TaskDeparted(SolTask* task, const Message& msg) {
+  const ghost_msg_payload_task_departed* payload =
+      static_cast<const ghost_msg_payload_task_departed*>(msg.payload());
+  bool from_switchto = payload->from_switchto;
+
   if (task->pending()) {
     RunRequest* req = enclave()->GetRunRequest(task->cpu);
     // Wait for txn to complete, because we might not get another message
@@ -139,10 +171,12 @@ void SolScheduler::TaskDeparted(SolTask* task, const Message& msg) {
     SyncCpuState(task->cpu);
   }
 
-  if (task->oncpu()) {
-    CpuState* cs = cpu_state_of(task);
-    CHECK_EQ(cs->current, task);
-    cs->current = nullptr;
+  if (task->yielding()) {
+    Unyield(task);
+  }
+
+  if (task->oncpu() || from_switchto) {
+    TaskOffCpu(task, /*blocked=*/false, from_switchto);
   } else if (task->queued()) {
     RemoveFromRunqueue(task);
   } else {
@@ -151,6 +185,10 @@ void SolScheduler::TaskDeparted(SolTask* task, const Message& msg) {
 
   allocator()->FreeTask(task);
   num_tasks_--;
+
+  // The msg exiting a switchto chain may wakeup a different agent than the
+  // local CPU's agent. (See go/kcl/373024.)
+  // However, since this is a global scheduler, we don't need a Ping() here.
 }
 
 void SolScheduler::TaskDead(SolTask* task, const Message& msg) {
@@ -163,7 +201,6 @@ bool SolScheduler::SyncCpuState(const Cpu& cpu) {
   CHECK(cpu.valid());
   CpuState* cs = cpu_state(cpu);
   CHECK_NE(cs->next, nullptr);
-  CHECK_EQ(cs->current, nullptr);
 
   SolTask* next = cs->next;
   CHECK(next->pending());
@@ -175,12 +212,21 @@ bool SolScheduler::SyncCpuState(const Cpu& cpu) {
   CHECK(!next->preempted);
 
   if (req->succeeded()) {
+    if (cs->current) {
+      // `cs->current` is not a nullptr when we are trying to preempt the
+      // currently running task because its preemption time slice expired.
+      CHECK(cs->current->oncpu());
+      cs->current->run_state = SolTask::RunState::kPreemptedByAgent;
+    }
     cs->current = next;
     next->run_state = SolTask::RunState::kOnCpu;
     next->prio_boost = false;
     return true;
   }
 
+  // The txn failed, so leave `cs->current` as is. If `cs->current` is not a
+  // nullptr, then the task we tried to preempt is still running on the CPU. We
+  // should put `next` back into the runqueue since it is not running.
   next->run_state = SolTask::RunState::kRunnable;
   Enqueue(next);
   return false;
@@ -195,56 +241,82 @@ void SolScheduler::SyncTaskState(SolTask* task) {
 }
 
 void SolScheduler::TaskBlocked(SolTask* task, const Message& msg) {
+  const ghost_msg_payload_task_blocked* payload =
+      static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
+  bool from_switchto = payload->from_switchto;
+
   if (task->pending()) {
     SyncTaskState(task);
   }
 
-  if (task->oncpu()) {
-    CpuState* cs = cpu_state_of(task);
-    CHECK_EQ(cs->current, task);
-    CHECK_EQ(cs->next, nullptr);
-    cs->current = nullptr;
+  if (task->oncpu() || from_switchto) {
+    TaskOffCpu(task, /*blocked=*/true, from_switchto);
+  } else if (task->preempted_by_agent()) {
+    // Do nothing. We cannot enqueue the task since it is blocked.
   } else {
     CHECK(task->queued());
     RemoveFromRunqueue(task);
   }
 
   task->run_state = SolTask::RunState::kBlocked;
+
+  // The msg exiting a switchto chain may wakeup a different agent than the
+  // local CPU's agent. (See go/kcl/373024.)
+  // However, since this is a global scheduler, we don't need a Ping() here.
 }
 
 void SolScheduler::TaskPreempted(SolTask* task, const Message& msg) {
+  const ghost_msg_payload_task_preempt* payload =
+      static_cast<const ghost_msg_payload_task_preempt*>(msg.payload());
+  bool from_switchto = payload->from_switchto;
+
   if (task->pending()) {
     SyncTaskState(task);
   }
 
   task->preempted = true;
 
-  if (task->oncpu()) {
-    CpuState* cs = cpu_state_of(task);
-    CHECK_EQ(cs->current, task);
-    CHECK_EQ(cs->next, nullptr);
-    cs->current = nullptr;
+  if (task->oncpu() || from_switchto) {
+    TaskOffCpu(task, /*blocked=*/false, from_switchto);
+    Enqueue(task);
+  } else if (task->preempted_by_agent()) {
     task->run_state = SolTask::RunState::kRunnable;
     Enqueue(task);
   } else {
     CHECK(task->queued());
   }
+
+  // The msg exiting a switchto chain may wakeup a different agent than the
+  // local CPU's agent. (See go/kcl/373024.)
+  // However, since this is a global scheduler, we don't need a Ping() here.
+}
+
+void SolScheduler::TaskSwitchto(SolTask* task, const Message& msg) {
+  TaskOffCpu(task, /*blocked=*/true, /*from_switchto=*/false);
 }
 
 void SolScheduler::TaskYield(SolTask* task, const Message& msg) {
+  const ghost_msg_payload_task_yield* payload =
+      static_cast<const ghost_msg_payload_task_yield*>(msg.payload());
+  bool from_switchto = payload->from_switchto;
+
   if (task->pending()) {
     SyncTaskState(task);
   }
 
-  if (task->oncpu()) {
-    CpuState* cs = cpu_state_of(task);
-    CHECK_EQ(cs->current, task);
-    CHECK_EQ(cs->next, nullptr);
-    cs->current = nullptr;
+  if (task->oncpu() || from_switchto) {
+    TaskOffCpu(task, /*blocked=*/false, from_switchto);
     Yield(task);
+  } else if (task->preempted_by_agent()) {
+    task->run_state = SolTask::RunState::kRunnable;
+    Enqueue(task);
   } else {
     CHECK(task->queued());
   }
+
+  // The msg exiting a switchto chain may wakeup a different agent than the
+  // local CPU's agent. (See go/kcl/373024.)
+  // However, since this is a global scheduler, we don't need a Ping() here.
 }
 
 void SolScheduler::Yield(SolTask* task) {
@@ -254,6 +326,17 @@ void SolScheduler::Yield(SolTask* task) {
   CHECK(task->oncpu() || task->runnable());
   task->run_state = SolTask::RunState::kYielding;
   yielding_tasks_.emplace_back(task);
+}
+
+void SolScheduler::Unyield(SolTask* task) {
+  CHECK(task->yielding());
+
+  auto it = std::find(yielding_tasks_.begin(), yielding_tasks_.end(), task);
+  CHECK(it != yielding_tasks_.end());
+  yielding_tasks_.erase(it);
+
+  task->run_state = SolTask::RunState::kRunnable;
+  Enqueue(task);
 }
 
 void SolScheduler::Enqueue(SolTask* task) {
@@ -297,7 +380,7 @@ void SolScheduler::RemoveFromRunqueue(SolTask* task) {
 }
 
 void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
-                                  StatusWord::BarrierToken agent_sw_last) {
+                                  BarrierToken agent_sw_last) {
   const int global_cpu_id = GetGlobalCPUId();
   CpuList available = topology()->EmptyCpuList();
   CpuList assigned = topology()->EmptyCpuList();
@@ -313,28 +396,33 @@ void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
       continue;
     }
 
-    if (cs->current) {
-      CHECK_EQ(cs->next, nullptr);
-      continue;
-    }
-
     if (cs->next) {
       if (req->committed()) {
         // Note that txn could have failed to commit in which case the
         // 'cs->next' will go back into the run queue.
         SyncCpuState(cpu);
+      } else {
+        // This CPU has a pending txn that we have not reaped yet.
+        continue;
       }
     }
 
-    // CPU has a pending txn that we haven't reaped yet.
-    if (cs->next) continue;
+    if (cs->current &&
+        (MonotonicNow() - cs->last_commit) < preemption_time_slice_) {
+      // A task is currently running on this CPU and it has not exceeded its
+      // preemption time slice, so do not schedule this CPU.
+      continue;
+    }
 
-    if (!cs->current) available.Set(cpu);
+    // No task is running on this CPU, so designate this CPU as available.
+    available.Set(cpu);
   }
 
   while (!available.Empty()) {
     SolTask* next = Dequeue();
-    if (!next) break;
+    if (!next) {
+      break;
+    }
 
     if (next->status_word.on_cpu() ||
         next->seqnum != next->status_word.barrier()) {
@@ -353,9 +441,11 @@ void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
           break;
         }
       }
-      if (!found) next->cpu = available.Front();
+      if (!found) {
+        next->cpu = available.Front();
+      }
     } else {
-      // previous cpu is available.
+      // The previous CPU is available.
     }
 
     CHECK(next->cpu.valid());
@@ -365,7 +455,6 @@ void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
 
     CpuState* cs = cpu_state(next->cpu);
     CHECK_EQ(cs->next, nullptr);
-    CHECK_EQ(cs->current, nullptr);
 
     RunRequest* req = enclave()->GetRunRequest(next->cpu);
     req->Open({
@@ -377,12 +466,21 @@ void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
     next->run_state = SolTask::RunState::kPending;
     if (next->preempted) {
       next->preempted = false;
-      next->prio_boost = true;  // boosted priority if txn commit fails.
+      next->prio_boost = true;  // Boosted priority if txn commit fails.
     }
   }
 
-  // Commit on all cpus with open transactions.
-  if (!assigned.Empty()) enclave()->SubmitRunRequests(assigned);
+  // Commit on all CPUs with open transactions. We may preempt currently running
+  // tasks if their time slice has expired. The ghOSt kernel will deliver a
+  // TASK_PREEMPT message for those preempted tasks, so we do not need to put
+  // those tasks back onto the runqueue here.
+  if (!assigned.Empty()) {
+    enclave()->SubmitRunRequests(assigned);
+    absl::Time now = MonotonicNow();
+    for (const Cpu& cpu : assigned) {
+      cpu_state(cpu)->last_commit = now;
+    }
+  }
 
   // Yielding tasks are moved back to the runqueue having skipped one round
   // of scheduling decisions.
@@ -396,7 +494,7 @@ void SolScheduler::GlobalSchedule(const StatusWord& agent_sw,
   }
 }
 
-bool SolScheduler::PickNextGlobalCPU(StatusWord::BarrierToken agent_barrier,
+bool SolScheduler::PickNextGlobalCPU(BarrierToken agent_barrier,
                                      const Cpu& this_cpu) {
   Cpu target(Cpu::UninitializedType::kUninitialized);
   Cpu global_cpu = topology()->cpu(GetGlobalCPUId());
@@ -478,12 +576,13 @@ found:
   return true;
 }
 
-std::unique_ptr<SolScheduler> SingleThreadSolScheduler(Enclave* enclave,
-                                                       CpuList cpus,
-                                                       int32_t global_cpu) {
+std::unique_ptr<SolScheduler> SingleThreadSolScheduler(
+    Enclave* enclave, CpuList cpulist, int32_t global_cpu,
+    int32_t numa_node, absl::Duration preemption_time_slice) {
   auto allocator = std::make_shared<SingleThreadMallocTaskAllocator<SolTask>>();
-  auto scheduler = absl::make_unique<SolScheduler>(
-      enclave, std::move(cpus), std::move(allocator), global_cpu);
+  auto scheduler = std::make_unique<SolScheduler>(
+      enclave, std::move(cpulist), std::move(allocator), global_cpu,
+      numa_node, preemption_time_slice);
   return scheduler;
 }
 
@@ -499,7 +598,7 @@ void SolAgent::AgentThread() {
   PeriodicEdge debug_out(absl::Seconds(1));
 
   while (!Finished() || !global_scheduler_->Empty()) {
-    StatusWord::BarrierToken agent_barrier = status_word().barrier();
+    BarrierToken agent_barrier = status_word().barrier();
     // Check if we're assigned as the Global agent.
     if (cpu().id() != global_scheduler_->GetGlobalCPUId()) {
       RunRequest* req = enclave()->GetRunRequest(cpu());
@@ -516,15 +615,24 @@ void SolAgent::AgentThread() {
 
       global_scheduler_->EnterSchedule();
 
+      global_scheduler_->EnterDispatch();
       Message msg;
+      uint64_t nr_msgs = 0;
       while (!(msg = global_channel.Peek()).empty()) {
         global_scheduler_->DispatchMessage(msg);
         global_channel.Consume(msg);
+        nr_msgs++;
       }
+      global_scheduler_->ExitDispatch(nr_msgs);
 
       global_scheduler_->GlobalSchedule(status_word(), agent_barrier);
 
       global_scheduler_->ExitSchedule();
+
+      if (global_scheduler_->dump_stats_) {
+        global_scheduler_->dump_stats_ = false;
+        global_scheduler_->DumpStats();
+      }
 
       if (verbose() && debug_out.Edge()) {
         static const int flags =

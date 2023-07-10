@@ -1,23 +1,14 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_SCHEDULERS_EDF_EDF_SCHEDULER_H_
 #define GHOST_SCHEDULERS_EDF_EDF_SCHEDULER_H_
 
 #include <cstdint>
+#include <memory>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/bind_front.h"
@@ -75,8 +66,7 @@ struct EdfTask : public Task<> {
 
   friend inline std::ostream& operator<<(std::ostream& os,
                                          EdfTask::RunState run_state) {
-    os << RunStateToString(run_state);
-    return os;
+    return os << RunStateToString(run_state);
   }
 
   RunState run_state = RunState::kBlocked;
@@ -182,8 +172,7 @@ class EdfScheduler : public BasicDispatchScheduler<EdfTask> {
   void UpdateRunqueuePosition(uint32_t pos);
   void CheckRunQueue();
 
-  void GlobalSchedule(const StatusWord& agent_sw,
-                      StatusWord::BarrierToken agent_sw_last);
+  void GlobalSchedule(const StatusWord& agent_sw, BarrierToken agent_sw_last);
 
   int32_t GetGlobalCPUId() {
     return global_cpu_.load(std::memory_order_acquire);
@@ -199,8 +188,7 @@ class EdfScheduler : public BasicDispatchScheduler<EdfTask> {
   static const int kDebugRunqueue = 1;
 
  private:
-  bool PreemptTask(EdfTask* prev, EdfTask* next,
-                   StatusWord::BarrierToken agent_barrier);
+  bool PreemptTask(EdfTask* prev, EdfTask* next, BarrierToken agent_barrier);
   void Yield(EdfTask* task);
   void Unyield(EdfTask* task);
   void Enqueue(EdfTask* task);
@@ -274,6 +262,8 @@ class GlobalEdfAgent : public FullAgent<EnclaveType> {
   }
 
   ~GlobalEdfAgent() override {
+    this->enclave_.SetDeliverCpuAvailability(false);
+    this->enclave_.SetDeliverAgentRunnability(false);
     // Terminate global agent before satellites to avoid a false negative error
     // from ghost_run(). e.g. when the global agent tries to schedule on a CPU
     // without an active satellite agent.
@@ -296,8 +286,8 @@ class GlobalEdfAgent : public FullAgent<EnclaveType> {
   }
 
   std::unique_ptr<Agent> MakeAgent(const Cpu& cpu) override {
-    return absl::make_unique<GlobalSatAgent>(&this->enclave_, cpu,
-                                             global_scheduler_.get());
+    return std::make_unique<GlobalSatAgent>(&this->enclave_, cpu,
+                                            global_scheduler_.get());
   }
 
   void RpcHandler(int64_t req, const AgentRpcArgs& args,

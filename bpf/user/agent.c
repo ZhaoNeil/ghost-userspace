@@ -1,18 +1,8 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "bpf/user/agent.h"
 #include "kernel/ghost_uapi.h"
@@ -41,13 +31,13 @@ static struct bpf_registration {
 	int fd;
 } bpf_registry [__MAX_BPF_GHOST_ATTACH_TYPE];
 
-static size_t map_mmap_sz(struct bpf_map *map)
+size_t bpf_map__mmap_sz(struct bpf_map *map)
 {
 	size_t mmap_sz;
 
-  mmap_sz = (size_t)roundup(bpf_map__value_size(map), 8) *
-      bpf_map__max_entries(map);
-  mmap_sz = roundup(mmap_sz, sysconf(_SC_PAGE_SIZE));
+	mmap_sz = (size_t)roundup(bpf_map__value_size(map), 8) *
+		bpf_map__max_entries(map);
+	mmap_sz = roundup(mmap_sz, sysconf(_SC_PAGE_SIZE));
 
 	return mmap_sz;
 }
@@ -56,13 +46,14 @@ static size_t map_mmap_sz(struct bpf_map *map)
 // munmap it with bpf_map__munmap().
 void *bpf_map__mmap(struct bpf_map *map)
 {
-	return mmap(NULL, map_mmap_sz(map), PROT_READ | PROT_WRITE, MAP_SHARED,
+	return mmap(NULL, bpf_map__mmap_sz(map),
+		    PROT_READ | PROT_WRITE, MAP_SHARED,
 		    bpf_map__fd(map), 0);
 }
 
 int bpf_map__munmap(struct bpf_map *map, void *addr)
 {
-	return munmap(addr, map_mmap_sz(map));
+	return munmap(addr, bpf_map__mmap_sz(map));
 }
 
 void bpf_program__set_types(struct bpf_program *prog, int prog_type,
@@ -94,6 +85,7 @@ static int insert_prog(int ctl_fd, struct bpf_program *prog)
 	switch (eat & 0xFFFF) {
 	case BPF_GHOST_SCHED_PNT:
 	case BPF_GHOST_MSG_SEND:
+	case BPF_GHOST_SELECT_RQ:
 		ret = bpf_link_create(prog_fd, ctl_fd, eat, NULL);
 		break;
 	default:

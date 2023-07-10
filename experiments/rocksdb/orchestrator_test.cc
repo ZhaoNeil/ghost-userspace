@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "experiments/rocksdb/orchestrator.h"
 
@@ -30,21 +22,22 @@ using ::testing::IsTrue;
 // can instantiate an orchestrator and test it.
 //
 // Example:
-// Orchestrator::Options options;
+// Options options;
 // ... Fill in 'options'.
 // TestOrchestrator orchestrator(options);
 // ... Test 'orchestrator'.
 class TestOrchestrator : public Orchestrator {
  public:
-  explicit TestOrchestrator(Orchestrator::Options options)
+  explicit TestOrchestrator(Options options)
       : Orchestrator(options, /*total_threads=*/0) {}
   ~TestOrchestrator() final {}
 
   void Terminate() final {}
 
   void Handle(Request& request) {
+    static thread_local std::string response;
     absl::BitGen gen;
-    HandleRequest(request, gen);
+    HandleRequest(request, response, gen);
   }
 
  protected:
@@ -72,8 +65,8 @@ bool IsWithin(absl::Duration actual, absl::Duration expected,
 }
 
 // Returns orchestrator options suitable for the tests.
-Orchestrator::Options GetOptions() {
-  Orchestrator::Options options;
+Options GetOptions() {
+  Options options;
 
   options.print_options.pretty = true;
   options.print_options.distribution = false;
@@ -85,12 +78,15 @@ Orchestrator::Options GetOptions() {
   options.throughput = 20'000.0;
   options.range_query_ratio = 0.005;
   // The background threads run on CPU 0, so run the load generator on CPU 1.
-  options.load_generator_cpu = 1;
-  options.cfs_dispatcher_cpu = 2;
+  options.load_generator_cpus =
+      ghost::MachineTopology()->ToCpuList(std::vector<int>{1});
+  options.cfs_dispatcher_cpus =
+      ghost::MachineTopology()->ToCpuList(std::vector<int>{2});
   options.num_workers = 2;
-  options.worker_cpus = {3, 4};
   options.cfs_wait_type = ThreadWait::WaitType::kSpin;
-  options.ghost_wait_type = Orchestrator::GhostWaitType::kFutex;
+  options.worker_cpus =
+      ghost::MachineTopology()->ToCpuList(std::vector<int>{3, 4});
+  options.ghost_wait_type = GhostWaitType::kFutex;
   options.get_duration = kGetRequestDuration;
   options.range_duration = kRangeQueryDuration;
   options.get_exponential_mean = absl::ZeroDuration();

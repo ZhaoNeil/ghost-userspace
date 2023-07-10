@@ -1,18 +1,8 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 // An Enclave represents the domain being managed by this process via ghOSt
 // policy APIs.  It encapsulates the collection of a topology, active Agents,
@@ -32,6 +22,7 @@
 #include <list>
 
 #include "absl/synchronization/mutex.h"
+#include "lib/channel.h"
 #include "lib/ghost.h"
 #include "lib/topology.h"
 
@@ -54,6 +45,7 @@ class AgentConfig {
   Topology* topology_;
   // If enclave_fd_ is set, then cpus_ is ignored.
   CpuList cpus_;
+  int numa_node_ = 0;
   int enclave_fd_ = -1;
   CpuTickConfig tick_config_ = CpuTickConfig::kNoTicks;
   int stderr_fd_ = 2;
@@ -111,8 +103,7 @@ class Enclave {
   // The agent calls this when it wants to yield its CPU without scheduling a
   // task on its own CPU.
   virtual void LocalYieldRunRequest(const RunRequest* req,
-                                    StatusWord::BarrierToken agent_barrier,
-                                    int flags) = 0;
+                                    BarrierToken agent_barrier, int flags) = 0;
 
   // Ping agent on the CPU that corresponds to `req`. Ping may fail if there is
   // no agent associated with that CPU.
@@ -152,8 +143,9 @@ class Enclave {
                          uint32_t idx)>
           l) = 0;
 
-  virtual void AdvertiseOnline() {}
-  virtual void PrepareToExit() {}
+  virtual void AdvertiseOnline() { is_online_ = true; }
+  virtual bool IsOnline() { return is_online_; }
+  virtual void PrepareToExit() { is_online_ = false; }
   // If there was an old agent attached to the enclave, this blocks until that
   // agent exits.
   virtual void WaitForOldAgent() = 0;
@@ -161,8 +153,11 @@ class Enclave {
   virtual void DisableMyBpfProgLoad() {}
   // LocalEnclaves have a ctl fd, which various agent functions use.
   virtual int GetCtlFd() { return -1; }
+  virtual int GetDirFd() { return -1; }
   virtual void SetRunnableTimeout(absl::Duration d) {}
   virtual void SetCommitAtTick(bool enabled) {}
+  virtual void SetDeliverAgentRunnability(bool enabled) {}
+  virtual void SetDeliverCpuAvailability(bool enabled) {}
   virtual void SetDeliverTicks(bool enabled) {}
   virtual void SetWakeOnWakerCpu(bool enabled) {}
   virtual void SetLiveDangerously(bool enabled) {}
@@ -197,6 +192,8 @@ class Enclave {
 
   Topology* topology() const { return topology_; }
   const CpuList* cpus() const { return &enclave_cpus_; }
+  virtual std::unique_ptr<Channel> MakeChannel(int elems, int node,
+                                               const CpuList& cpulist) = 0;
 
   // Specializations for Attach and Detach must invoke the base method.
   // Note: Invoked by the actual thread associated with the Agent, prior to
@@ -220,6 +217,7 @@ class Enclave {
   absl::Mutex mu_;
   std::list<Scheduler*> schedulers_ ABSL_GUARDED_BY(mu_);
   std::list<Agent*> agents_ ABSL_GUARDED_BY(mu_);
+  bool is_online_ = false;
 
   friend class Scheduler;
 };
@@ -244,13 +242,13 @@ struct RunRequestOptions {
   // `target_barrier` is copied directly into txn->task_barrier and is used
   // by the kernel to ensure that the agent has consumed the latest message
   // associated with the task.
-  StatusWord::BarrierToken target_barrier = StatusWord::NullBarrierToken();
+  BarrierToken target_barrier = StatusWord::NullBarrierToken();
 
   // `agent_barrier` is copied directly into txn->agent_barrier and is used
   // by the kernel to ensure that the agent has consumed all notifications
   // posted to it. This barrier is checked only for local commits and the
   // default `NullBarrierToken()` is legal value for remote commits.
-  StatusWord::BarrierToken agent_barrier = StatusWord::NullBarrierToken();
+  BarrierToken agent_barrier = StatusWord::NullBarrierToken();
 
   // `commit_flags` is copied directly into txn->commit_flags and controls
   // how a transaction is committed.
@@ -273,7 +271,8 @@ struct RunRequestOptions {
   bool allow_txn_target_on_cpu = false;
 };
 
-// RunRequest implements a transactional Ghost::Run() API.  This enables:
+// RunRequest implements a transactional GhostHelper()->Run() API.  This
+// enables:
 //  1. Asynchronous and Batch dispatch.  A RunRequest may be asynchronously
 //     invoked once opened.  Allowing amortization versus synchronous
 //     transmission.
@@ -323,13 +322,13 @@ class RunRequest {
   //
   // REQUIRES: Must be called by the agent of cpu().
   // TODO: This could locally submit when there's a READY transaction.
-  void LocalYield(const StatusWord::BarrierToken agent_barrier,
-                  const int flags) {
+  void LocalYield(const BarrierToken agent_barrier, const int flags) {
     enclave_->LocalYieldRunRequest(this, agent_barrier, flags);
   }
 
   // Ping() and queued-runs could interact with each other (when Ping clobbers
-  // the transaction) so use the Ghost::Run() based ping to sidestep the issue.
+  // the transaction) so use the GhostHelper()->Run() based ping to sidestep the
+  // issue.
   //
   // TODO: revisit when agent is able to to arbitrate txn ownership.
   bool Ping() { return enclave_->PingRunRequest(this); }
@@ -379,13 +378,13 @@ class RunRequest {
   virtual bool sync_group_owned() const = 0;
 
   // Returns the transaction's agent_barrier field.
-  virtual StatusWord::BarrierToken agent_barrier() const = 0;
+  virtual BarrierToken agent_barrier() const = 0;
 
   // Returns the transaction's gtid field.
   virtual Gtid target() const = 0;
 
   // Returns the transaction's task_barrier field.
-  virtual StatusWord::BarrierToken target_barrier() const = 0;
+  virtual BarrierToken target_barrier() const = 0;
 
   // Returns the transaction's commit_flags field.
   virtual int commit_flags() const = 0;
@@ -449,17 +448,13 @@ class LocalRunRequest : public RunRequest {
   }
 
   // Returns the transaction's agent_barrier field.
-  StatusWord::BarrierToken agent_barrier() const override {
-    return txn_->agent_barrier;
-  }
+  BarrierToken agent_barrier() const override { return txn_->agent_barrier; }
 
   // Returns the transaction's gtid field.
   Gtid target() const override { return Gtid(txn_->gtid); }
 
   // Returns the transaction's task_barrier field.
-  StatusWord::BarrierToken target_barrier() const override {
-    return txn_->task_barrier;
-  }
+  BarrierToken target_barrier() const override { return txn_->task_barrier; }
 
   // Returns the transaction's commit_flags field.
   int commit_flags() const override { return txn_->commit_flags; }
@@ -493,8 +488,7 @@ class LocalEnclave final : public Enclave {
   bool CommitRunRequest(RunRequest* req) final;
   void SubmitRunRequest(RunRequest* req) final;
   bool CompleteRunRequest(RunRequest* req) final;
-  void LocalYieldRunRequest(const RunRequest* req,
-                            StatusWord::BarrierToken agent_barrier,
+  void LocalYieldRunRequest(const RunRequest* req, BarrierToken agent_barrier,
                             int flags) final;
   bool PingRunRequest(const RunRequest* req) final;
 
@@ -502,6 +496,11 @@ class LocalEnclave final : public Enclave {
   void SubmitRunRequests(const CpuList& cpu_list) final;
   bool CommitSyncRequests(const CpuList& cpu_list) final;
   bool SubmitSyncRequests(const CpuList& cpu_list) final;
+
+  std::unique_ptr<Channel> MakeChannel(int elems, int node,
+                                       const CpuList& cpulist) {
+    return std::make_unique<LocalChannel>(elems, node, cpulist);
+  }
 
   Agent* GetAgent(const Cpu& cpu) final { return rep(cpu)->agent; }
   void AttachAgent(const Cpu& cpu, Agent* agent) final;
@@ -516,23 +515,33 @@ class LocalEnclave final : public Enclave {
   }
 
   void SetCommitAtTick(bool enabled) final {
-    const char* val = enabled ? "1" : "0";
-    WriteEnclaveTunable(dir_fd_, "commit_at_tick", val);
+    WriteEnclaveTunable(dir_fd_, "commit_at_tick",
+                        BoolToTunableString(enabled));
+  }
+
+  void SetDeliverAgentRunnability(bool enabled) final {
+    WriteEnclaveTunable(dir_fd_, "deliver_agent_runnability",
+                        BoolToTunableString(enabled));
+  }
+
+  void SetDeliverCpuAvailability(bool enabled) final {
+    WriteEnclaveTunable(dir_fd_, "deliver_cpu_availability",
+                        BoolToTunableString(enabled));
   }
 
   void SetDeliverTicks(bool enabled) final {
-    const char* val = enabled ? "1" : "0";
-    WriteEnclaveTunable(dir_fd_, "deliver_ticks", val);
+    WriteEnclaveTunable(dir_fd_, "deliver_ticks",
+                        BoolToTunableString(enabled));
   }
 
   void SetWakeOnWakerCpu(bool enabled) final {
-    const char* val = enabled ? "1" : "0";
-    WriteEnclaveTunable(dir_fd_, "wake_on_waker_cpu", val);
+    WriteEnclaveTunable(dir_fd_, "wake_on_waker_cpu",
+                        BoolToTunableString(enabled));
   }
 
   void SetLiveDangerously(bool enabled) final {
-    const char* val = enabled ? "1" : "0";
-    WriteEnclaveTunable(dir_fd_, "live_dangerously", val);
+    WriteEnclaveTunable(dir_fd_, "live_dangerously",
+                        BoolToTunableString(enabled));
   }
 
   // The kernel will send a task_new for every task in the enclave
@@ -562,11 +571,14 @@ class LocalEnclave final : public Enclave {
   }
 
   int GetCtlFd() final { return ctl_fd_; }
+  int GetDirFd() final { return dir_fd_; }
 
   static int MakeNextEnclave();
   static int GetEnclaveDirectory(int ctl_fd);
   static void WriteEnclaveTunable(int dir_fd, absl::string_view tunable_path,
                                   absl::string_view tunable_value);
+  static std::string ReadEnclaveTunable(int dir_fd,
+                                        absl::string_view tunable_path);
   static int GetCpuDataRegion(int dir_fd);
   // Waits on an enclave's agent_online until the value of the file was 'until'
   // (either 0 or 1) at some point in time.
@@ -590,6 +602,7 @@ class LocalEnclave final : public Enclave {
   } ABSL_CACHELINE_ALIGNED;
 
   CpuRep* rep(const Cpu& cpu) { return &cpus_[cpu.id()]; }
+  std::string BoolToTunableString(bool b) { return b ? "1" : "0"; }
 
   CpuRep cpus_[MAX_CPUS];
   ghost_cpu_data* data_region_ = nullptr;

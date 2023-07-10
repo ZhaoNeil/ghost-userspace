@@ -1,18 +1,8 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_EXPERIMENTS_ROCKSDB_CFS_ORCHESTRATOR_H_
 #define GHOST_EXPERIMENTS_ROCKSDB_CFS_ORCHESTRATOR_H_
@@ -31,7 +21,7 @@ namespace ghost_test {
 // futex until more work is assigned to them.
 //
 // Example:
-// Orchestrator::Options options;
+// Options options;
 // ... Fill in the options.
 // CfsOrchestrator orchestrator_(options);
 // (Constructs orchestrator with options.)
@@ -40,7 +30,7 @@ namespace ghost_test {
 // (Tells orchestrator to stop the experiment and print the results.)
 class CfsOrchestrator final : public Orchestrator {
  public:
-  explicit CfsOrchestrator(Orchestrator::Options opts);
+  explicit CfsOrchestrator(Options opts);
   ~CfsOrchestrator() final {}
 
   void Terminate() final;
@@ -59,16 +49,12 @@ class CfsOrchestrator final : public Orchestrator {
 
   // The dispatcher calls this method to receive requests sent to it by the load
   // generator.
-  void HandleLoadGenerator();
+  void HandleLoadGenerator(uint32_t sid);
 
   // The dispatcher calls this method to populate 'idle_sids_' with a list of
   // the SIDs of idle workers. Note that this method clears 'idle_sids_' before
   // filling it in.
-  void GetIdleWorkerSIDs();
-
-  // The total number of threads, including the load generator thread, the
-  // dispatcher thread, and the worker threads.
-  const size_t total_threads_ = 0;
+  void GetIdleWorkerSIDs(uint32_t sid);
 
   // Allows runnable threads to run and keeps idle threads either spinning or
   // sleeping on a futex until they are marked runnable again.
@@ -87,14 +73,15 @@ class CfsOrchestrator final : public Orchestrator {
   // the dispatcher.
   static constexpr size_t kLoadGeneratorBatchSize = 100;
 
-  // The dispatcher's queue on waiting requests to assign to workers.
-  std::deque<Request> dispatcher_queue_;
+  // The dispatchers' queues to hold waiting requests that will later be
+  // assigned to workers.
+  std::vector<std::deque<Request>> dispatcher_queue_;
 
-  // The dispatcher uses this to store idle SIDs. We make this a class member
+  // The dispatchers use this to store idle SIDs. We make this a class member
   // rather than a local variable in the 'Dispatcher' method to avoid repeatedly
-  // allocating memory for the list backing in the dispatcher common case, which
-  // is expensive.
-  std::list<uint32_t> idle_sids_;
+  // allocating memory for the list backing in the dispatchers' common case,
+  // which is expensive.
+  std::vector<std::list<uint32_t>> idle_sids_;
 };
 
 }  // namespace ghost_test

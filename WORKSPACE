@@ -31,18 +31,20 @@ http_archive(
 load("@rules_foreign_cc//foreign_cc:repositories.bzl", "rules_foreign_cc_dependencies")
 rules_foreign_cc_dependencies()
 
+# Abseil live HEAD (Nov 17, 2022)
 http_archive(
   name = "com_google_absl",
-  url = "https://github.com/abseil/abseil-cpp/archive/2e9532cc6c701a8323d0cffb468999ab804095ab.zip",
-  sha256 = "542dee3a6692cf7851329f4f9f4de463bb6305c7e0439946d4ba750852e4d71c",
-  strip_prefix = "abseil-cpp-2e9532cc6c701a8323d0cffb468999ab804095ab",
+  url = "https://github.com/abseil/abseil-cpp/archive/ebab79b5783b3298ee2f31251174c660c322d7ef.zip",
+  sha256 = "c3b9d19cd38cd475f60b5756db1bdc6d10ed43e5c7ce7374eae9a57d763d0597",
+  strip_prefix = "abseil-cpp-ebab79b5783b3298ee2f31251174c660c322d7ef",
 )
 
+# GoogleTest release-1.12.1 (Jun 27 2022)
 http_archive(
   name = "com_google_googletest",
-  url = "https://github.com/google/googletest/archive/011959aafddcd30611003de96cfd8d7a7685c700.zip",
-  sha256 = "6a5d7d63cd6e0ad2a7130471105a3b83799a7a2b14ef7ec8d742b54f01a4833c",
-  strip_prefix = "googletest-011959aafddcd30611003de96cfd8d7a7685c700",
+  url = "https://github.com/google/googletest/archive/58d77fa8070e8cec2dc1ed015d66b454c8d78850.zip",
+  sha256 = "ab78fa3f912d44d38b785ec011a25f26512aaedc5291f51f3807c592b506d33a",
+  strip_prefix = "googletest-58d77fa8070e8cec2dc1ed015d66b454c8d78850",
 )
 
 http_archive(
@@ -60,12 +62,13 @@ http_archive(
     strip_prefix = "gflags-827c769e5fc98e0f2a34c47cef953cc6328abced",
 )
 
+# OneTBB live HEAD (Jan 2 2023)
 # A dependency of rocksdb that is required for rocksdb::ClockCache.
 http_archive(
     name = "tbb",
-    url = "https://github.com/oneapi-src/oneTBB/archive/d1667d514df697f05d771602b268e92560c434c4.tar.gz",
-    sha256 = "b5936aac1ffbc3767cae2377199647d663159a597f8e5958c5979bbf3b8d6384",
-    strip_prefix = "oneTBB-d1667d514df697f05d771602b268e92560c434c4",
+    url = "https://github.com/oneapi-src/oneTBB/archive/e6e493f96ec8b7e2e2b4d048ed49356eb54ec2a0.tar.gz",
+    sha256 = "42f11cb14215043b9e49cbce6b22b5bec9f3e59deb14047100b52a1eee34c514",
+    strip_prefix = "oneTBB-e6e493f96ec8b7e2e2b4d048ed49356eb54ec2a0",
 )
 
 http_archive(
@@ -81,6 +84,15 @@ http_archive(
     url = "https://github.com/google/subpar/archive/9fae6b63cfeace2e0fb93c9c1ebdc28d3991b16f.tar.gz",
     sha256 = "481233d60c547e0902d381cd4fb85b63168130379600f330821475ad234d9336",
     strip_prefix = "subpar-9fae6b63cfeace2e0fb93c9c1ebdc28d3991b16f",
+)
+
+http_archive(
+    name = "rules_license",
+    urls = [
+        "https://github.com/bazelbuild/rules_license/releases/download/0.0.4/rules_license-0.0.4.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_license/releases/download/0.0.4/rules_license-0.0.4.tar.gz",
+    ],
+    sha256 = "6157e1e68378532d0241ecd15d3c45f6e5cfd98fc10846045509fb2a7cc9e381",
 )
 
 http_archive(

@@ -1,28 +1,19 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "tests/capabilities_test.h"
 
 #include <fstream>
-
-#include "kernel/ghost_uapi.h"
-#include "lib/agent.h"
-#include "lib/channel.h"
-#include "lib/ghost.h"
+#include <memory>
 
 #include "bpf/user/agent.h"
 #include "bpf/user/test_bpf.skel.h"
+#include "lib/agent.h"
+#include "lib/channel.h"
+#include "lib/ghost.h"
 
 // These tests check that ghOSt properly accepts/rejects syscalls based on the
 // capabilities that the calling thread holds.
@@ -40,8 +31,10 @@ TEST(CapabilitiesTest, RunNice) {
   Topology* topology = MachineTopology();
   LocalEnclave enclave(AgentConfig(topology, topology->EmptyCpuList()));
 
-  EXPECT_THAT(Ghost::Run(Gtid::Current(), /*agent_barrier=*/0,
-                         /*task_barrier=*/0, /*cpu=*/-1, /*flags=*/0),
+  EXPECT_THAT(GhostHelper()->Run(Gtid::Current(), /*agent_barrier=*/0,
+                                 /*task_barrier=*/0,
+                                 Cpu(Cpu::UninitializedType::kUninitialized),
+                                 /*flags=*/0),
               Eq(-1));
   EXPECT_THAT(errno, Eq(EINVAL));
 }
@@ -81,7 +74,7 @@ class CapabilitiesAgent : public LocalAgent {
     // up by a ping from the main test thread on termination.
     RunRequest* req = enclave()->GetRunRequest(cpu());
     while (!Finished()) {
-      StatusWord::BarrierToken agent_barrier = status_word().barrier();
+      BarrierToken agent_barrier = status_word().barrier();
       req->LocalYield(agent_barrier, /*flags=*/0);
     }
   }
@@ -97,7 +90,7 @@ TEST(CapabilitiesTest, AgentNice) {
   // We call enclave->Ready() and that will disable our ability to load bpf
   // programs.  Do this in another process so we can run other gunit tests.
   ForkedProcess fp([]() {
-    Ghost::InitCore();
+    GhostHelper()->InitCore();
 
     AssertNiceCapabilitySet();
 
@@ -105,8 +98,8 @@ TEST(CapabilitiesTest, AgentNice) {
     // computer must have at least one CPU.
     constexpr int kAgentCpu = 0;
     Topology* topology = MachineTopology();
-    auto enclave = absl::make_unique<LocalEnclave>(
-        AgentConfig(topology, topology->ToCpuList(std::vector<int>{kAgentCpu})));
+    auto enclave = std::make_unique<LocalEnclave>(AgentConfig(
+        topology, topology->ToCpuList(std::vector<int>{kAgentCpu})));
     LocalChannel default_channel(GHOST_MAX_QUEUE_ELEMS, /*node=*/0);
     default_channel.SetEnclaveDefault();
 
@@ -139,8 +132,10 @@ TEST(CapabilitiesTest, RunNoNice) {
     Topology* topology = MachineTopology();
     LocalEnclave enclave(AgentConfig(topology, topology->EmptyCpuList()));
 
-    EXPECT_THAT(Ghost::Run(Gtid::Current(), /*agent_barrier=*/0,
-                           /*task_barrier=*/0, /*cpu=*/-1, /*flags=*/0),
+    EXPECT_THAT(GhostHelper()->Run(Gtid::Current(), /*agent_barrier=*/0,
+                                   /*task_barrier=*/0,
+                                   Cpu(Cpu::UninitializedType::kUninitialized),
+                                   /*flags=*/0),
                 Eq(-1));
     EXPECT_THAT(errno, Eq(EPERM));
   });
@@ -163,7 +158,11 @@ TEST(CapabilitiesTest, AgentNoNice) {
     DropNiceCapability();
     // We do not need initialize an enclave, a channel, etc., for the agent
     // since the call below will fail before these are needed.
-    EXPECT_THAT(SchedAgentEnterGhost(enclave.GetCtlFd(), chan.GetFd()), Eq(-1));
+    EXPECT_THAT(
+        GhostHelper()->SchedAgentEnterGhost(enclave.GetCtlFd(),
+                                            MachineTopology()->cpu(0),
+                                            chan.GetFd()),
+        Eq(-1));
     EXPECT_THAT(errno, Eq(EPERM));
   });
   thread.join();
@@ -194,6 +193,73 @@ TEST(CapabilitiesTest, BpfProgLoad) {
 TEST(CapabilitiesTest, BpfProgLoadTwice) {
   TestBpfProgLoad();
   TestBpfProgLoad();
+}
+
+int libbpf_print_none(enum libbpf_print_level, const char *, va_list ap)
+{
+  return 0;
+}
+
+TEST(CapabilitiesTest, DisableBpfProgLoad) {
+  // We disable our ability to load bpf programs, so we must do this in another
+  // process so we can keep running tests from this process.
+  ForkedProcess fp([]() {
+    LocalEnclave enclave(AgentConfig{MachineTopology()});
+
+    enclave.DisableMyBpfProgLoad();
+
+    struct test_bpf* bpf_obj = test_bpf__open();
+    CHECK_NE(bpf_obj, nullptr);
+
+    bpf_program__set_types(bpf_obj->progs.test_pnt,
+                           BPF_PROG_TYPE_GHOST_SCHED, BPF_GHOST_SCHED_PNT);
+
+    // libbpf will loudly complain when we fail to load
+    libbpf_set_print(libbpf_print_none);
+
+    CHECK_EQ(test_bpf__load(bpf_obj), -1);
+    CHECK_EQ(errno, EPERM);
+
+    test_bpf__destroy(bpf_obj);
+
+    return 0;
+  });
+
+  fp.WaitForChildExit();
+}
+
+// Had a bug where the Disable didn't follow certain operations that changed the
+// group_leader, e.g. fork.
+TEST(CapabilitiesTest, DisableBpfProgLoadFork) {
+  // One fork so Disable doesn't taint our testing process
+  ForkedProcess fp([]() {
+    LocalEnclave enclave(AgentConfig{MachineTopology()});
+
+    enclave.DisableMyBpfProgLoad();
+
+    // Second fork that should inherit the Disable.
+    ForkedProcess fp2([]() {
+      struct test_bpf* bpf_obj = test_bpf__open();
+      CHECK_NE(bpf_obj, nullptr);
+
+      bpf_program__set_types(bpf_obj->progs.test_pnt,
+                             BPF_PROG_TYPE_GHOST_SCHED, BPF_GHOST_SCHED_PNT);
+
+      libbpf_set_print(libbpf_print_none);
+
+      CHECK_EQ(test_bpf__load(bpf_obj), -1);
+      CHECK_EQ(errno, EPERM);
+
+      test_bpf__destroy(bpf_obj);
+
+      return 0;
+    });
+
+    fp2.WaitForChildExit();
+    return 0;
+  });
+
+  fp.WaitForChildExit();
 }
 
 }  // namespace

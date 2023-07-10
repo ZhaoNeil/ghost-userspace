@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include <cstdint>
 #include <string>
@@ -29,7 +21,7 @@ namespace ghost {
 
 static void ParseAgentConfig(AgentConfig* config) {
   CpuList ghost_cpus =
-      ghost::MachineTopology()->ParseCpuStr(absl::GetFlag(FLAGS_ghost_cpus));
+      MachineTopology()->ParseCpuStr(absl::GetFlag(FLAGS_ghost_cpus));
   CHECK(!ghost_cpus.Empty());
 
   Topology* topology = MachineTopology();
@@ -58,7 +50,7 @@ int main(int argc, char* argv[]) {
   auto uap = new ghost::AgentProcess<ghost::FullFifoAgent<ghost::LocalEnclave>,
                                      ghost::AgentConfig>(config);
 
-  ghost::Ghost::InitCore();
+  ghost::GhostHelper()->InitCore();
   printf("Initialization complete, ghOSt active.\n");
   // When `stdout` is directed to a terminal, it is newline-buffered. When
   // `stdout` is directed to a non-interactive device (e.g, a Python subprocess

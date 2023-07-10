@@ -1,24 +1,15 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_SCHEDULERS_SHINJUKU_SHINJUKU_SCHEDULER_H
 #define GHOST_SCHEDULERS_SHINJUKU_SHINJUKU_SCHEDULER_H
 
 #include <cstdint>
 #include <map>
+#include <memory>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/bind_front.h"
@@ -93,27 +84,19 @@ struct ShinjukuTask : public Task<> {
 
   friend std::ostream& operator<<(std::ostream& os,
                                   ShinjukuTask::RunState run_state) {
-    os << RunStateToString(run_state);
-    return os;
+    return os << RunStateToString(run_state);
   }
 
   friend std::ostream& operator<<(
       std::ostream& os, ShinjukuTask::UnscheduleLevel unschedule_level) {
     switch (unschedule_level) {
       case ShinjukuTask::UnscheduleLevel::kNoUnschedule:
-        os << "No Unschedule";
-        break;
+        return os << "No Unschedule";
       case ShinjukuTask::UnscheduleLevel::kCouldUnschedule:
-        os << "Could Unschedule";
-        break;
+        return os << "Could Unschedule";
       case ShinjukuTask::UnscheduleLevel::kMustUnschedule:
-        os << "Must Unschedule";
-        break;
-        // We will get a compile error if a new member is added to the
-        // `ShinjukuTask::UnscheduleLevel` enum and a corresponding case is not
-        // added here.
+        return os << "Must Unschedule";
     }
-    return os;
   }
 
   RunState run_state = RunState::kBlocked;
@@ -192,8 +175,7 @@ class ShinjukuScheduler : public BasicDispatchScheduler<ShinjukuTask> {
   bool SkipForSchedule(int iteration, const Cpu& cpu);
 
   // Main scheduling function for the global agent.
-  void GlobalSchedule(const StatusWord& agent_sw,
-                      StatusWord::BarrierToken agent_sw_last);
+  void GlobalSchedule(const StatusWord& agent_sw, BarrierToken agent_sw_last);
 
   int32_t GetGlobalCPUId() {
     return global_cpu_.load(std::memory_order_acquire);
@@ -207,7 +189,7 @@ class ShinjukuScheduler : public BasicDispatchScheduler<ShinjukuTask> {
   // global agent's CPU, the global agent calls this function to try to pick a
   // new CPU to move to and, if a new CPU is found, to initiate the handoff
   // process.
-  void PickNextGlobalCPU(StatusWord::BarrierToken agent_barrier);
+  void PickNextGlobalCPU(BarrierToken agent_barrier);
 
   // Print debug details about the current tasks managed by the global agent,
   // CPU state, and runqueue stats.
@@ -383,8 +365,8 @@ class FullShinjukuAgent : public FullAgent<EnclaveType> {
   }
 
   std::unique_ptr<Agent> MakeAgent(const Cpu& cpu) override {
-    return absl::make_unique<ShinjukuAgent>(&this->enclave_, cpu,
-                                            global_scheduler_.get());
+    return std::make_unique<ShinjukuAgent>(&this->enclave_, cpu,
+                                           global_scheduler_.get());
   }
 
   void RpcHandler(int64_t req, const AgentRpcArgs& args,

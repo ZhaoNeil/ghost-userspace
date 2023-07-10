@@ -1,32 +1,25 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 // A currently poorly organized collection of core helpers.
 #ifndef GHOST_LIB_GHOST_H_
 #define GHOST_LIB_GHOST_H_
 
 #include <sys/ioctl.h>
+#include <sys/timerfd.h>
 
 #include <csignal>
 #include <cstdint>
+#include <fstream>
 #include <unordered_map>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
+#include "absl/strings/str_split.h"
 #include "kernel/ghost_uapi.h"
 #include "lib/base.h"
 #include "lib/logging.h"
@@ -42,6 +35,8 @@ static inline int verbose() {
 }
 
 static inline void set_verbose(int32_t v) { absl::SetFlag(&FLAGS_verbose, v); }
+
+typedef uint32_t BarrierToken;
 
 class StatusWordTable {
  public:
@@ -97,52 +92,52 @@ class LocalStatusWordTable : public StatusWordTable {
 // TODO: Syscall definition needs fixing for any hope of 32-bit compat.
 class Ghost {
  public:
-  static void InitCore();
+  virtual ~Ghost() {}
 
-  static int Run(const Gtid gtid, const uint32_t agent_barrier,
-                 const uint32_t task_barrier, const int cpu, const int flags) {
+  virtual void InitCore();
+
+  virtual int Run(const Gtid& gtid, BarrierToken agent_barrier,
+                  BarrierToken task_barrier, const Cpu& cpu, int flags) {
     ghost_ioc_run data = {
-      .gtid = gtid.id(),
-      .agent_barrier = agent_barrier,
-      .task_barrier = task_barrier,
-      .run_cpu = cpu,
-      .run_flags = flags,
+        .gtid = gtid.id(),
+        .agent_barrier = agent_barrier,
+        .task_barrier = task_barrier,
+        .run_cpu = cpu.valid() ? cpu.id() : -1,
+        .run_flags = flags,
     };
     return ioctl(gbl_ctl_fd_, GHOST_IOC_RUN, &data);
-
   }
 
-  static int SyncCommit(cpu_set_t* const cpuset) {
+  virtual int SyncCommit(cpu_set_t& cpuset) {
     ghost_ioc_commit_txn data = {
-        .mask_ptr = cpuset,
-        .mask_len = sizeof(cpu_set_t),
+        .mask_ptr = &cpuset,
+        .mask_len = sizeof(cpuset),
         .flags = 0,
     };
     return ioctl(gbl_ctl_fd_, GHOST_IOC_SYNC_GROUP_TXN, &data);
   }
 
-  static int Commit(cpu_set_t* const cpuset) {
+  virtual int Commit(cpu_set_t& cpuset) {
     ghost_ioc_commit_txn data = {
-        .mask_ptr = cpuset,
-        .mask_len = sizeof(cpu_set_t),
+        .mask_ptr = &cpuset,
+        .mask_len = sizeof(cpuset),
         .flags = 0,
     };
     return ioctl(gbl_ctl_fd_, GHOST_IOC_COMMIT_TXN, &data);
   }
 
-  static int Commit(const int cpu) {
+  virtual int Commit(const Cpu& cpu) {
     cpu_set_t cpuset;
 
-    CHECK_GE(cpu, 0);
-    CHECK_LT(cpu, CPU_SETSIZE);
+    CHECK_GE(cpu.id(), 0);
+    CHECK_LT(cpu.id(), CPU_SETSIZE);
 
     CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    return Commit(&cpuset);
+    CPU_SET(cpu.id(), &cpuset);
+    return Commit(cpuset);
   }
 
-  static int CreateQueue(const int elems, const int node, const int flags,
-                         uint64_t& mapsize) {
+  virtual int CreateQueue(int elems, int node, int flags, uint64_t& mapsize) {
     ghost_ioc_create_queue data = {
         .elems = elems,
         .node = node,
@@ -158,7 +153,7 @@ class Ghost {
   // kernel.
   //
   // Returns 0 on success and -1 on failure ('errno' is set on failure).
-  static int RemoveQueueWakeup(const int queue_fd) {
+  virtual int RemoveQueueWakeup(int queue_fd) {
     return ConfigQueueWakeup(queue_fd, MachineTopology()->EmptyCpuList(),
                              /*flags=*/0);
   }
@@ -167,8 +162,8 @@ class Ghost {
   // into the queue denoted by 'queue_fd'.
   //
   // Returns 0 on success and -1 on failure ('errno' is set on failure).
-  static int ConfigQueueWakeup(const int queue_fd, const CpuList& cpulist,
-                               const int flags) {
+  virtual int ConfigQueueWakeup(int queue_fd, const CpuList& cpulist,
+                                int flags) {
     std::vector<ghost_agent_wakeup> wakeup;
     for (const Cpu& cpu : cpulist) {
       wakeup.push_back({
@@ -186,9 +181,8 @@ class Ghost {
     return ioctl(gbl_ctl_fd_, GHOST_IOC_CONFIG_QUEUE_WAKEUP, &data);
   }
 
-  static int AssociateQueue(const int queue_fd, const ghost_type type,
-                            const uint64_t arg, const int barrier,
-                            const int flags, int* status) {
+  virtual int AssociateQueue(int queue_fd, ghost_type type, uint64_t arg,
+                             BarrierToken barrier, int flags) {
     ghost_msg_src msg_src = {
         .type = type,
         .arg = arg,
@@ -200,17 +194,10 @@ class Ghost {
         .barrier = barrier,
         .flags = flags,
     };
-
-    int assoc_status = ioctl(gbl_ctl_fd_, GHOST_IOC_ASSOC_QUEUE, &data);
-    int err = (assoc_status < 0) ? assoc_status : 0;
-
-    if (status != nullptr) {
-      *status = err ? 0 : assoc_status;
-    }
-    return err;
+    return ioctl(gbl_ctl_fd_, GHOST_IOC_ASSOC_QUEUE, &data);
   }
 
-  static int SetDefaultQueue(const int queue_fd) {
+  virtual int SetDefaultQueue(int queue_fd) {
     ghost_ioc_set_default_queue data = {
         .fd = queue_fd,
     };
@@ -218,34 +205,42 @@ class Ghost {
     return ioctl(gbl_ctl_fd_, GHOST_IOC_SET_DEFAULT_QUEUE, &data);
   }
 
-  static int GetStatusWordInfo(const ghost_type type, const uint64_t arg,
-                               ghost_sw_info* const info) {
+  virtual int GetStatusWordInfo(ghost_type type, uint64_t arg,
+                                ghost_sw_info& info) {
     ghost_ioc_sw_get_info data;
     data.request.type = type;
     data.request.arg = arg;
     int err = ioctl(gbl_ctl_fd_, GHOST_IOC_SW_GET_INFO, &data);
-    if (err) return err;
-    *info = data.response;
+    if (err) {
+      return err;
+    }
+
+    info = data.response;
     return 0;
   }
 
-  static int FreeStatusWordInfo(ghost_sw_info* const info) {
-    return ioctl(gbl_ctl_fd_, GHOST_IOC_SW_FREE, info);
+  virtual int FreeStatusWordInfo(ghost_sw_info& info) {
+    return ioctl(gbl_ctl_fd_, GHOST_IOC_SW_FREE, &info);
   }
 
   // This is needed for when a sched item is updated in the shared PrioTable. A
   // write to a sched item indicates that the sched item was updated for a new
   // closure. We want to update the runtime of the task so that we don't bill
   // the new closure for CPU time used by the old closure.
-  static int GetTaskRuntime(const Gtid gtid, absl::Duration* const cpu_time) {
+  virtual int GetTaskRuntime(const Gtid& gtid, absl::Duration& cpu_time) {
     ghost_ioc_get_cpu_time data = {
         .gtid = gtid.id(),
     };
-    const int ret = ioctl(gbl_ctl_fd_, GHOST_IOC_GET_CPU_TIME, &data);
+    int ret = ioctl(gbl_ctl_fd_, GHOST_IOC_GET_CPU_TIME, &data);
     if (ret == 0) {
-      *cpu_time = absl::Nanoseconds(data.runtime);
+      cpu_time = absl::Nanoseconds(data.runtime);
     }
     return ret;
+  }
+
+  // Creates a timerfd.
+  virtual int TimerFdCreate(int clockid, int flags) {
+    return timerfd_create(clockid, flags);
   }
 
   // Associate a timerfd with agent on 'cpu':
@@ -255,11 +250,8 @@ class Ghost {
   // any msg.
   // - type: an opaque value that is reflected back in CPU_TIMER_EXPIRED msg.
   // - cookie: an opaque value that is reflected back in CPU_TIMER_EXPIRED msg.
-  static int TimerFdSettime(
-      const int fd, const int flags, itimerspec* const itimerspec,
-      const Cpu& cpu = Cpu(Cpu::UninitializedType::kUninitialized),
-      const uint64_t type = 0,
-      const uint64_t cookie = 0) {
+  virtual int TimerFdSettime(int fd, int flags, itimerspec& itimerspec,
+                             const Cpu& cpu, uint64_t type, uint64_t cookie) {
     timerfd_ghost timerfd_ghost = {
         .cpu = cpu.valid() ? cpu.id() : -1,
         .flags = cpu.valid() ? TIMERFD_GHOST_ENABLED : 0,
@@ -269,8 +261,8 @@ class Ghost {
     ghost_ioc_timerfd_settime data = {
         .timerfd = fd,
         .flags = flags,
-        .in_tmr = itimerspec,
-        .out_tmr = NULL,
+        .in_tmr = &itimerspec,
+        .out_tmr = nullptr,
         .timerfd_ghost = timerfd_ghost,
     };
     return ioctl(gbl_ctl_fd_, GHOST_IOC_TIMERFD_SETTIME, &data);
@@ -281,11 +273,34 @@ class Ghost {
   // Returns the ghOSt abi versions supported by the kernel.
   static int GetSupportedVersions(std::vector<uint32_t>& versions);
 
+  // Check /proc/pid/cmdline for the --ghost_version flag and return true if it
+  // is present. This function is called by CheckVersion(), so it runs on
+  // startup when kVersionCheck is initialized.
+  // We check for the flag manually instead of using absl::ParseCommandLine()
+  // since we want to output the version and quit before possibly getting a
+  // versions mismatch error in CheckVersion().
+  static bool GetVersion() {
+    std::ifstream cmdline_file;
+    cmdline_file.open("/proc/self/cmdline");
+    std::string cmdline;
+    cmdline_file >> cmdline;
+    cmdline_file.close();
+
+    // The command-line stored in /proc/pid/cmdline is NULL char-delimited.
+    std::vector<absl::string_view> argv = absl::StrSplit(cmdline, '\0');
+    return std::find(argv.begin(), argv.end(), "--ghost_version") != argv.end();
+  }
+
   // Checks that the userspace ABI version matches the kernel ABI version.
   // This method performs a 'CHECK_EQ' so that the process dies if the versions
   // do not match. This is useful since this method runs on startup when
   // 'kVersionCheck' is initialized in the agent.
   static bool CheckVersion() {
+    if (GetVersion()) {
+      std::cerr << GHOST_VERSION << std::endl;
+      exit(0);
+    }
+
     std::vector<uint32_t> versions;
     CHECK_EQ(GetSupportedVersions(versions), 0);
 
@@ -297,7 +312,7 @@ class Ghost {
       std::cerr << "Ghost version " << GHOST_VERSION << " not supported"
                 << std::endl;
       std::cerr << "Kernel supports versions: ";
-      for (auto const& i : versions) {
+      for (uint32_t i : versions) {
         std::cerr << i << ' ';
       }
       std::cerr << std::endl;
@@ -307,23 +322,23 @@ class Ghost {
     return iter != versions.end();
   }
 
-  static void SetGlobalEnclaveFds(int ctl_fd, int dir_fd) {
+  virtual void SetGlobalEnclaveFds(int ctl_fd, int dir_fd) {
     gbl_ctl_fd_ = ctl_fd;
     gbl_dir_fd_ = dir_fd;
   }
-  static int GetGlobalEnclaveCtlFd() { return gbl_ctl_fd_; }
-  static int GetGlobalEnclaveDirFd() { return gbl_dir_fd_; }
-  static void CloseGlobalEnclaveFds() {
+  virtual int GetGlobalEnclaveCtlFd() { return gbl_ctl_fd_; }
+  virtual int GetGlobalEnclaveDirFd() { return gbl_dir_fd_; }
+  virtual void CloseGlobalEnclaveFds() {
     if (gbl_ctl_fd_ >= 0) close(gbl_ctl_fd_);
     gbl_ctl_fd_ = -1;
     if (gbl_dir_fd_ >= 0) close(gbl_dir_fd_);
     gbl_dir_fd_ = -1;
   }
 
-  static void SetGlobalStatusWordTable(StatusWordTable* swt) {
+  virtual void SetGlobalStatusWordTable(StatusWordTable* swt) {
     gbl_sw_table_ = swt;
   }
-  static StatusWordTable* GetGlobalStatusWordTable() {
+  StatusWordTable* GetGlobalStatusWordTable() {
     CHECK_NE(gbl_sw_table_, nullptr);
     return gbl_sw_table_;
   }
@@ -331,7 +346,7 @@ class Ghost {
   // Gets the CPU affinity for the task with the provided Gtid and writes the
   // result to the provided CpuList.
   // Returns 0 on success. Otherwise, returns -1 with errno set.
-  static int SchedGetAffinity(const Gtid& gtid, CpuList& cpulist) {
+  virtual int SchedGetAffinity(const Gtid& gtid, CpuList& cpulist) {
     cpu_set_t allowed_cpus;
     CPU_ZERO(&allowed_cpus);
     if (sched_getaffinity(gtid.tid(), sizeof(allowed_cpus), &allowed_cpus)) {
@@ -347,17 +362,31 @@ class Ghost {
   // Sets the CPU affinity for the task with the provided `gtid` from the
   // set of cpus in `cpulist`.
   // Returns 0 on success. Otherwise, returns -1 with errno set.
-  static int SchedSetAffinity(const Gtid& gtid, const CpuList& cpulist) {
+  virtual int SchedSetAffinity(const Gtid& gtid, const CpuList& cpulist) {
     cpu_set_t cpuset = Topology::ToCpuSet(cpulist);
     return sched_setaffinity(gtid.tid(), sizeof(cpuset), &cpuset);
   }
 
-  static constexpr const char kGhostfsMount[] = "/sys/fs/ghost";
+  // Returns the sched class that the task `gtid` is in.
+  virtual int SchedGetScheduler(const Gtid& gtid) {
+    return sched_getscheduler(gtid.tid());
+  }
+
+  // Moves the specified thread to the ghOSt scheduling class, using the enclave
+  // dir_fd.  `pid` may be a pid_t or a raw gtid. If dir_fd is -1, this will use
+  // the enclave dir_fd previously set with SetGlobalEnclaveFds().
+  virtual int SchedTaskEnterGhost(int64_t pid, int dir_fd);
+  virtual int SchedTaskEnterGhost(const Gtid& gtid, int dir_fd);
+  // Makes calling thread the ghost agent on `cpu`.  Note that the calling
+  // thread must have the `CAP_SYS_NICE` capability to make itself an agent.
+  virtual int SchedAgentEnterGhost(int ctl_fd, const Cpu& cpu, int queue_fd);
+
+  static constexpr char kGhostfsMount[] = "/sys/fs/ghost";
 
  private:
-  static int gbl_ctl_fd_;
-  static int gbl_dir_fd_;
-  static StatusWordTable* gbl_sw_table_;
+  int gbl_ctl_fd_ = -1;
+  int gbl_dir_fd_ = -1;
+  StatusWordTable* gbl_sw_table_;
 };
 
 class GhostSignals {
@@ -382,7 +411,6 @@ class GhostSignals {
 class StatusWord {
  public:
   struct AgentSW {};
-  typedef uint32_t BarrierToken;
 
   // REQUIRES: *this must be empty.
   virtual ~StatusWord();
@@ -411,11 +439,13 @@ class StatusWord {
   bool stale(BarrierToken prev) const { return prev == barrier(); }
 
   bool in_use() const { return sw_flags() & GHOST_SW_F_INUSE; }
-  bool can_free() const { return sw_flags() & GHOST_SW_F_CANFREE; }
+  virtual bool can_free() const { return sw_flags() & GHOST_SW_F_CANFREE; }
   bool on_cpu() const { return sw_flags() & GHOST_SW_TASK_ONCPU; }
   bool cpu_avail() const { return sw_flags() & GHOST_SW_CPU_AVAIL; }
   bool runnable() const { return sw_flags() & GHOST_SW_TASK_RUNNABLE; }
-  bool boosted_priority() const { return sw_flags() & GHOST_SW_BOOST_PRIO; }
+  virtual bool boosted_priority() const {
+    return sw_flags() & GHOST_SW_BOOST_PRIO;
+  }
 
   uint32_t id() const { return sw_info_.id; }
 
@@ -512,26 +542,20 @@ class GhostThread {
     kGhost,
   };
 
-  explicit GhostThread(KernelScheduler ksched, std::function<void()> work);
+  explicit GhostThread(KernelScheduler ksched, std::function<void()> work,
+                       int dir_fd = -1);
   explicit GhostThread(const GhostThread&) = delete;
   GhostThread& operator=(const GhostThread&) = delete;
   ~GhostThread();
 
-  friend std::ostream& operator<<(
-      std::ostream& os, const GhostThread::KernelScheduler& kernel_scheduler) {
-    switch (kernel_scheduler) {
+  friend std::ostream& operator<<(std::ostream& os,
+                                  GhostThread::KernelScheduler scheduler) {
+    switch (scheduler) {
       case GhostThread::KernelScheduler::kCfs:
-        os << "CFS";
-        break;
+        return os << "CFS";
       case GhostThread::KernelScheduler::kGhost:
-        os << "ghOSt";
-        break;
-      default:
-        GHOST_ERROR("`kernel_scheduler` has non-enumerator value %d.",
-                    static_cast<int>(kernel_scheduler));
-        break;
+        return os << "ghOSt";
     }
-    return os;
   }
 
   // Joins the thread.
@@ -570,13 +594,47 @@ class GhostThread {
   std::thread thread_;
 };
 
-// Moves the thread with PID `pid` to the ghOSt scheduling class, using the
-// enclave dir_fd.  If dir_fd is -1, this will use the enclave dir_fd previously
-// set with SetGlobalEnclaveFds().
-int SchedTaskEnterGhost(pid_t pid, int dir_fd = -1);
-// Makes the calling thread an agent.  Note that the calling thread must have
-// the `CAP_SYS_NICE` capability to make itself an agent.
-int SchedAgentEnterGhost(int ctl_fd, int queue_fd);
+// Test helper class that launches threads and performs operations on them while
+// they do their work.
+//
+// You don't have to do anything in remote_work.  In that case, this class just
+// helps you spawn and join on num_threads.
+class RemoteThreadTester {
+ public:
+  RemoteThreadTester(int num_threads = 1000) : num_threads_(num_threads) {}
+  ~RemoteThreadTester() {};
+  RemoteThreadTester& operator=(const RemoteThreadTester&) = delete;
+
+  // Spawns threads, each of which does `thread_work()` in a loop at least once.
+  //
+  // Once the threads are up, all threads are notified to start their work loop.
+  // Then we run `remote_work(GhostThread*)` on each thread.
+  // After all remote_work is done, the threads are notified to exit.
+  // Once they are joined, Run() returns.
+  void Run(std::function<void()> thread_work,
+           std::function<void(GhostThread*)> remote_work =
+                                             [](GhostThread* t) {});
+
+ private:
+  int num_threads_;
+  std::atomic<int> num_threads_at_barrier_;
+  Notification start_;
+  Notification exit_;
+  std::vector<std::unique_ptr<GhostThread>> threads_;
+};
+
+// Returns the Ghost helper instance for this machine. The pointer is never null
+// and is owned by the  `GhostHelper` function. The pointer lives until the
+// process dies.
+Ghost* GhostHelper();
+
+// Frees the current `GhostHelper()` pointer and updates it to `ghost_helper`.
+// This is useful for providing custom implementations of Ghost helper
+// functions.
+//
+// This function is not thread-safe. You should generally only call it once when
+// the process starts.
+void UpdateGhostHelper(Ghost* ghost_helper);
 
 }  // namespace ghost
 

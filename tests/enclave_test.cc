@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "lib/enclave.h"
 
@@ -20,12 +12,15 @@
 #include "gtest/gtest.h"
 #include "schedulers/fifo/centralized/fifo_scheduler.h"
 
+ABSL_FLAG(std::string, test_tmpdir, "/tmp",
+          "A temporary file system directory that the test can access");
+
 namespace ghost {
 namespace {
 
 class EnclaveTest : public ::testing::Test {
  protected:
-  static void SetUpTestSuite() { Ghost::InitCore(); }
+  static void SetUpTestSuite() { GhostHelper()->InitCore(); }
 };
 
 bool WriteEnclaveCpus(int fd, const std::string& data) {
@@ -59,7 +54,7 @@ TEST_F(EnclaveTest, TxnRegionFree) {
   const AgentConfig config(topology, topology->all_cpus());
 
   // Create an enclave.
-  auto enclave = absl::make_unique<LocalEnclave>(config);
+  auto enclave = std::make_unique<LocalEnclave>(config);
 
   // Destroy the enclave - this should release the transaction region
   // buffers in the destructor.
@@ -69,7 +64,7 @@ TEST_F(EnclaveTest, TxnRegionFree) {
   //
   // The constructor will CHECK fail if it cannot allocate the txn region
   // so if this succeeds the destructor is properly releasing the resource.
-  enclave = absl::make_unique<LocalEnclave>(config);
+  enclave = std::make_unique<LocalEnclave>(config);
 
   SUCCEED();
 }
@@ -264,19 +259,27 @@ TEST_F(EnclaveTest, CpuListComma) {
 
   // Linux's cpumask requires a comma between every 32 bit chunk (8 hex
   // nibbles).  We want to test having at least one comma. (1,84218421)
-  CpuList comma_list = MachineTopology()->ToCpuList(
+  UpdateTestTopology(absl::GetFlag(FLAGS_test_tmpdir), /*has_l3_cache=*/false);
+  CpuList comma_list = TestTopology()->ToCpuList(
       std::vector<int>{0, 5, 10, 15, 16, 21, 26, 31, 32});
   std::string comma_str = comma_list.CpuMaskStr();
 
-  if (!WriteEnclaveCpus(cpumask_fd, comma_str)) {
-    // We can legitimately fail if we're on a machine with too few cpus, but
-    // EOVERFLOW means our cpumask wasn't parsed by the kernel.
-    CHECK_NE(errno, EOVERFLOW);
+  // If we have more than 32 cpus, setting the cpumask should succeed.
+  if (MachineTopology()->num_cpus() > comma_list.Back().id()) {
+    EXPECT_TRUE(WriteEnclaveCpus(cpumask_fd, comma_str));
+  } else if (!WriteEnclaveCpus(cpumask_fd, comma_str)) {
+    // If WriteEnclaveCpus fails with 32 or less CPUs, the test case should
+    // fail with EOVERFLOW indicating the given CPU mask contains a mask bit
+    // set for a CPU whose ID is larger than the number of possible CPUs on
+    // this machine. WriteEnclaveCpus may succeed if NR_CPUS and nmaskbits
+    // are fixed to some large enough numbers - in that case, we do
+    // not have to check anything.
+    EXPECT_EQ(errno, EOVERFLOW);
   }
 
   close(cpumask_fd);
-
   close(enclave_fd);
+
   LocalEnclave::DestroyEnclave(ctl_fd);
   close(ctl_fd);
 }
@@ -324,7 +327,7 @@ TEST_F(EnclaveTest, DestroyAndSetsched) {
 
       SpinFor(absl::Microseconds(kLoops) - absl::Microseconds(i));
 
-      int ret = SchedTaskEnterGhost(/*pid=*/0, enclave_fd);
+      int ret = GhostHelper()->SchedTaskEnterGhost(/*pid=*/0, enclave_fd);
       if (ret != 0) {
         switch (errno) {
           case ENXIO:
@@ -394,10 +397,46 @@ TEST_F(EnclaveTest, DestroyAndSetsched) {
 
 TEST_F(EnclaveTest, GetNrTasks) {
   Topology* topology = MachineTopology();
-  auto enclave = absl::make_unique<LocalEnclave>(
+  auto enclave = std::make_unique<LocalEnclave>(
       AgentConfig(topology, topology->all_cpus()));
 
   EXPECT_EQ(enclave->GetNrTasks(), 0);
+}
+
+TEST_F(EnclaveTest, SetDeliverAgentRunnability) {
+  Topology* topology = MachineTopology();
+  auto enclave = std::make_unique<LocalEnclave>(
+      AgentConfig(topology, topology->all_cpus()));
+
+  std::string val =
+    LocalEnclave::ReadEnclaveTunable(enclave->GetDirFd(),
+                                     "deliver_agent_runnability");
+  EXPECT_EQ(val, "0");
+
+  enclave->SetDeliverAgentRunnability(true);
+
+  val =
+    LocalEnclave::ReadEnclaveTunable(enclave->GetDirFd(),
+                                     "deliver_agent_runnability");
+  EXPECT_EQ(val, "1");
+}
+
+TEST_F(EnclaveTest, SetDeliverCpuAvailability) {
+  Topology* topology = MachineTopology();
+  auto enclave = std::make_unique<LocalEnclave>(
+      AgentConfig(topology, topology->all_cpus()));
+
+  std::string val =
+    LocalEnclave::ReadEnclaveTunable(enclave->GetDirFd(),
+                                     "deliver_cpu_availability");
+  EXPECT_EQ(val, "0");
+
+  enclave->SetDeliverCpuAvailability(true);
+
+  val =
+    LocalEnclave::ReadEnclaveTunable(enclave->GetDirFd(),
+                                     "deliver_cpu_availability");
+  EXPECT_EQ(val, "1");
 }
 
 // Tests killing an enclave from ghostfs while an agent is running.  This broke
@@ -424,8 +463,8 @@ TEST_F(EnclaveTest, KillActiveEnclave) {
 
   FifoConfig config;
   config.topology_ = MachineTopology();
-  config.global_cpu_ = config.topology_->cpu(0);
   config.enclave_fd_ = enclave_fd;
+  config.global_cpu_ = config.topology_->cpu(0);
 
   auto ap = new AgentProcess<FullFifoAgent<LocalEnclave>, FifoConfig>(config);
   EXPECT_EQ(close(enclave_fd), 0);

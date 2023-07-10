@@ -1,16 +1,8 @@
 # Copyright 2021 Google LLC
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file or at
+# https://developers.google.com/open-source/licenses/bsd
 """Options dataclasses for RocksDB, the Antagonist, and ghOSt.
 
 This file contains the options for RocksDB, the Antagonist, and ghOSt. It also
@@ -165,9 +157,9 @@ class RocksDBOptions:
     throughput: The synthetic throughput used in the experiment.
     range_query_ratio: The share of requests that are Range queries. 1 -
       `range_query_ratio` is the share of requests that are Get requests.
-    load_generator_cpu: The CPU that the load generator runs on.
-    cfs_dispatcher_cpu: For CFS (Linux Completely Fair Scheduler) experiments,
-      the CPU that the dispatcher runs on.
+    load_generator_cpus: The CPUs that the load generators run on.
+    cfs_dispatcher_cpus: For CFS (Linux Completely Fair Scheduler) experiments,
+      the CPUs that the dispatchers run on.
     num_workers: The number of workers. Each worker has one thread.
     worker_cpus: For CFS (Linux Completely Fair Scheduler) experiments, the CPUs
       that the workers run on. For ghOSt experiments, this list should be empty
@@ -200,8 +192,8 @@ class RocksDBOptions:
   rocksdb_db_path: str = os.path.join(TMPFS_MOUNT, "orch_db")
   throughput: int = 20000
   range_query_ratio: float = 0.0
-  load_generator_cpu: int = _FIRST_CPU
-  cfs_dispatcher_cpu: int = _FIRST_CPU + 1
+  load_generator_cpus: int = _FIRST_CPU
+  cfs_dispatcher_cpus: int = _FIRST_CPU + 1
   num_workers: int = _NUM_ROCKSDB_WORKERS
   worker_cpus: List[int] = field(default_factory=GetDefaultRocksDBWorkerCpus)
   cfs_wait_type: CfsWaitType = CfsWaitType.SPIN
@@ -299,11 +291,11 @@ def GetRocksDBOptions(scheduler: Scheduler, num_cpus: int, num_workers: int):
 
   r = RocksDBOptions()
   r.scheduler = scheduler
-  r.load_generator_cpu = _FIRST_CPU
+  r.load_generator_cpus = _FIRST_CPU
   r.num_workers = num_workers
   if scheduler == Scheduler.CFS:
     # For CFS, each thread is pinned to a unique CPU.
-    r.cfs_dispatcher_cpu = _FIRST_CPU + 1
+    r.cfs_dispatcher_cpus = _FIRST_CPU + 1
     r.worker_cpus = list(range(_FIRST_CPU + 2, _FIRST_CPU + num_cpus))
   else:
     if scheduler != Scheduler.GHOST:

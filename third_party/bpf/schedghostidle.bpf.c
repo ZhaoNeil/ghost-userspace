@@ -17,6 +17,7 @@
 #include "libbpf/bpf_tracing.h"
 // clang-format on
 
+#include "third_party/bpf/common.bpf.h"
 #include "third_party/iovisor_bcc/bits.bpf.h"
 
 #define MAX_CPUS 512
@@ -98,8 +99,6 @@ static void update_hist(u64 nsec)
 	*count += 1;
 }
 
-#define SEND_TASK_LATCHED (1 << 10)
-
 SEC("tp_btf/sched_ghost_latched")
 int BPF_PROG(sched_ghost_latched, struct task_struct *old,
 	     struct task_struct *new, int run_flags)
@@ -108,8 +107,8 @@ int BPF_PROG(sched_ghost_latched, struct task_struct *old,
 	struct cpu_info *ci = bpf_map_lookup_elem(&cpu_info, &cpu);
 
 	__sync_fetch_and_add(&nr_latches, 1);
-	/* BPF-PNT is the only one who uses SEND_TASK_LATCHED. */
-	if (run_flags & SEND_TASK_LATCHED)
+	/* BPF-PNT is the only one who uses SEND_TASK_ON_CPU. */
+	if (run_flags & SEND_TASK_ON_CPU)
 		__sync_fetch_and_add(&nr_bpf_latches, 1);
 
 	if (!ci || !ci->is_idle) {
@@ -117,7 +116,7 @@ int BPF_PROG(sched_ghost_latched, struct task_struct *old,
 		 * When BPF-PNT latches a task, the cpu might not go idle.
 		 * However, we'd like to measure those events.
 		 */
-		if (run_flags & SEND_TASK_LATCHED)
+		if (run_flags & SEND_TASK_ON_CPU)
 			update_hist(0);
 		return 0;
 	}

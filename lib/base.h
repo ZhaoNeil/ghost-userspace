@@ -1,18 +1,8 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 // A small library of support functionality with no uapi dependencies that can
 // be shared between agent and clients.  This is picked up by both the agent and
@@ -24,6 +14,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <sys/capability.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -35,18 +26,29 @@
 
 #include "absl/base/call_once.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
 #include "absl/memory/memory.h"
+#include "absl/status/statusor.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "lib/logging.h"
 
+ABSL_DECLARE_FLAG(std::string, ghost_procfs_prefix);
+ABSL_DECLARE_FLAG(bool, emit_fork_warnings);
+
 namespace ghost {
+
+// Returns the path to access the requested procfs file (eg. since proc may not
+// be mounted at root).
+std::string GetProc(const std::string& procfs_path);
 
 inline pid_t GetTID();
 void Exit(int code);
 size_t GetFileSize(int fd);
 void SpinFor(absl::Duration remaining);
 void PrintBacktrace(FILE* f, void* uctx = nullptr);
+bool CapHas(cap_value_t cap);
 
 // This is useful for reading non-atomic variables that may be changed by the
 // kernel or by other threads. There are three main advantages to wrapping a
@@ -127,7 +129,7 @@ inline pid_t GetTID() {
 //
 // Most callers should never need to call this function (preferring
 // Gtid::Current() since it caches the gtid in a thread-local var).
-int64_t GetGtid();
+absl::StatusOr<int64_t> GetGtid();
 
 // Issues the equivalent of an x86 `pause` instruction on the target
 // architecture. This is generally useful to call in the body of a spinlock loop
@@ -164,9 +166,12 @@ class Gtid {
 
   // Returns the GTID for the calling thread.
   static inline Gtid Current() {
-    static thread_local int64_t gtid = GetGtid();
+    static thread_local int64_t gtid = GetGtid().value_or(-1);
     return Gtid(gtid);
   }
+
+  // Returns the GTID for a given thread.
+  static absl::StatusOr<Gtid> FromTid(int64_t tid);
 
   // Returns the raw GTID number.
   int64_t id() const { return gtid_raw_; }
@@ -184,8 +189,7 @@ class Gtid {
   bool operator!() const { return id() == 0; }
 
   friend std::ostream& operator<<(std::ostream& os, const Gtid& gtid) {
-    os << gtid.id();
-    return os;
+    return os << gtid.id();
   }
 
   // These are just some simple debug helpers to make things more readable.
@@ -339,20 +343,12 @@ class Notification {
                                   Notification::NotifiedState notified_state) {
     switch (notified_state) {
       case Notification::NotifiedState::kNoWaiter:
-        os << "No Waiter";
-        break;
+        return os << "No Waiter";
       case Notification::NotifiedState::kWaiter:
-        os << "Waiter";
-        break;
+        return os << "Waiter";
       case Notification::NotifiedState::kNotified:
-        os << "Notified";
-        break;
-      default:
-        GHOST_ERROR("`notified_state` has non-enumerator value %d.",
-                    static_cast<int>(notified_state));
-        break;
+        return os << "Notified";
     }
-    return os;
   }
 
   // The notification state.

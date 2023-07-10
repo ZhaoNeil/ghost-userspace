@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "agent.h"
 
@@ -40,15 +32,12 @@ void LocalAgent::ThreadBody() {
     // there is a default for the enclave.
     queue_fd = -1;
   } else {
-    queue_fd = s->GetDefaultChannel().GetFd();
+    queue_fd = s->GetAgentChannel(cpu_).GetFd();
   }
 
   CHECK_EQ(prctl(PR_SET_NAME, absl::StrCat("ap_task_", cpu().id()).c_str()), 0);
 
   gtid_ = Gtid::Current();
-  CHECK_EQ(Ghost::SchedSetAffinity(Gtid::Current(),
-                                   MachineTopology()->ToCpuList({cpu_})),
-           0);
   enclave_->WaitForOldAgent();
 
   // setsched may fail with EBUSY, which is when there is an old agent that has
@@ -58,7 +47,8 @@ void LocalAgent::ThreadBody() {
   // WaitForOldAgent.
   int ret;
   do {
-    ret = SchedAgentEnterGhost(enclave_->GetCtlFd(), queue_fd);
+    ret = GhostHelper()->SchedAgentEnterGhost(enclave_->GetCtlFd(), cpu_,
+                                              queue_fd);
   } while (ret && errno == EBUSY);
   CHECK_EQ(ret, 0);
 

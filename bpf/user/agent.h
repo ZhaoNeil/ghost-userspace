@@ -1,18 +1,8 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_BPF_USER_AGENT_H_
 #define GHOST_BPF_USER_AGENT_H_
@@ -21,6 +11,13 @@
 
 #include "libbpf/bpf.h"
 #include "libbpf/libbpf.h"
+
+// See e.g. smp_store_release().  We can't check when we compile the BPF
+// programs, which are built with clang -target bpf, but all agents that load
+// bpf programs include this header.
+#ifndef __x86_64__
+#error "BPF shared memory sync only works on x86"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,9 +33,11 @@ extern "C" {
 enum {
   BPF_PROG_TYPE_GHOST_SCHED = 1000,
   BPF_PROG_TYPE_GHOST_MSG,
+  BPF_PROG_TYPE_GHOST_SELECT_RQ,
 
   BPF_GHOST_SCHED_PNT = 2000,
   BPF_GHOST_MSG_SEND,
+  BPF_GHOST_SELECT_RQ,
   __MAX_BPF_GHOST_ATTACH_TYPE
 };
 
@@ -48,6 +47,7 @@ enum {
 
 // Generic BPF helpers
 
+size_t bpf_map__mmap_sz(struct bpf_map *map);
 void *bpf_map__mmap(struct bpf_map *map);
 int bpf_map__munmap(struct bpf_map *map, void *addr);
 void bpf_program__set_types(struct bpf_program *prog, int prog_type,

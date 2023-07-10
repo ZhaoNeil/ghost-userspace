@@ -1,18 +1,12 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/edf/edf_scheduler.h"
+
+#include <memory>
 
 #include "absl/strings/str_format.h"
 #include "bpf/user/agent.h"
@@ -30,18 +24,18 @@ void EdfTask::SetRuntime(absl::Duration new_runtime,
 
 void EdfTask::UpdateRuntime() {
   // We access the runtime from the status word rather than call
-  // `Ghost::GetTaskRuntime()` as that function does a system call that acquires
-  // a runqueue lock if the task is currently running. Acquiring this lock harms
-  // tail latency. Reading the runtime from the status word is just a memory
-  // access. However, the runtime in the status word may be stale if the task is
-  // currently running, as the runtime in the status word is updated on each
-  // call to `update_curr_ghost()` in the kernel. Thus, we accept some staleness
-  // in the runtime for improved performance.
+  // `GhostHelper()->GetTaskRuntime()` as that function does a system call that
+  // acquires a runqueue lock if the task is currently running. Acquiring this
+  // lock harms tail latency. Reading the runtime from the status word is just a
+  // memory access. However, the runtime in the status word may be stale if the
+  // task is currently running, as the runtime in the status word is updated on
+  // each call to `update_curr_ghost()` in the kernel. Thus, we accept some
+  // staleness in the runtime for improved performance.
   //
   // Note that the runtime in the status word is updated when the task is taken
   // off of the CPU (e.g., on a block, yield, preempt, etc.). Additionally,
-  // `Ghost::GetTaskRuntime()` does not need to acquire a runqueue lock when the
-  // task is off of the CPU.
+  // `GhostHelper()->GetTaskRuntime()` does not need to acquire a runqueue lock
+  // when the task is off of the CPU.
   SetRuntime(absl::Nanoseconds(status_word.runtime()),
              /*update_elapsed_runtime=*/true);
 }
@@ -78,7 +72,7 @@ EdfScheduler::EdfScheduler(Enclave* enclave, CpuList cpulist,
   bpf_obj_ = edf_bpf__open();
   CHECK_NE(bpf_obj_, nullptr);
 
-  bpf_map__resize(bpf_obj_->maps.cpu_data, libbpf_num_possible_cpus());
+  bpf_map__set_max_entries(bpf_obj_->maps.cpu_data, libbpf_num_possible_cpus());
 
   bpf_program__set_types(bpf_obj_->progs.edf_pnt,
                          BPF_PROG_TYPE_GHOST_SCHED, BPF_GHOST_SCHED_PNT);
@@ -103,6 +97,9 @@ EdfScheduler::EdfScheduler(Enclave* enclave, CpuList cpulist,
   bpf_data_ = static_cast<struct edf_bpf_per_cpu_data*>(
       bpf_map__mmap(bpf_obj_->maps.cpu_data));
   CHECK_NE(bpf_data_, MAP_FAILED);
+
+  // AGENT_BLOCKED and AGENT_WAKEUP are filtered by BPF.
+  enclave->SetDeliverAgentRunnability(true);
 }
 
 EdfScheduler::~EdfScheduler() {
@@ -171,7 +168,7 @@ void EdfScheduler::HandleNewGtid(EdfTask* task, pid_t tgid) {
   CHECK_GE(tgid, 0);
 
   if (orchs_.find(tgid) == orchs_.end()) {
-    auto orch = absl::make_unique<Orchestrator>();
+    auto orch = std::make_unique<Orchestrator>();
     if (!orch->Init(tgid)) {
       // If the task's group leader has already exited and closed the PrioTable
       // fd while we are handling TaskNew, it is possible that we cannot find
@@ -248,6 +245,10 @@ void EdfScheduler::TaskRunnable(EdfTask* task, const Message& msg) {
 }
 
 void EdfScheduler::TaskDeparted(EdfTask* task, const Message& msg) {
+  if (task->yielding()) {
+    Unyield(task);
+  }
+
   if (task->oncpu()) {
     CpuState* cs = cpu_state_of(task);
     CHECK_EQ(cs->current, task);
@@ -255,7 +256,7 @@ void EdfScheduler::TaskDeparted(EdfTask* task, const Message& msg) {
   } else if (task->queued()) {
     RemoveFromRunqueue(task);
   } else {
-    CHECK(task->blocked());
+    CHECK(task->blocked() || task->paused());
   }
 
   allocator()->FreeTask(task);
@@ -354,7 +355,7 @@ void EdfScheduler::DiscoveryComplete() {
 }
 
 bool EdfScheduler::PreemptTask(EdfTask* prev, EdfTask* next,
-                               StatusWord::BarrierToken agent_barrier) {
+                               BarrierToken agent_barrier) {
   GHOST_DPRINT(2, stderr, "PREEMPT(%d)\n", prev->cpu);
   Cpu cpu = topology()->cpu(prev->cpu);
 
@@ -682,7 +683,7 @@ void EdfScheduler::UpdateSchedParams() {
 }
 
 void EdfScheduler::GlobalSchedule(const StatusWord& agent_sw,
-                                  StatusWord::BarrierToken agent_sw_last) {
+                                  BarrierToken agent_sw_last) {
   CpuList updated_cpus = MachineTopology()->EmptyCpuList();
 
   for (const Cpu& cpu : cpus()) {
@@ -809,8 +810,8 @@ std::unique_ptr<EdfScheduler> SingleThreadEdfScheduler(Enclave* enclave,
                                                        CpuList cpulist,
                                                        GlobalConfig& config) {
   auto allocator = std::make_shared<SingleThreadMallocTaskAllocator<EdfTask>>();
-  auto scheduler = absl::make_unique<EdfScheduler>(
-      enclave, std::move(cpulist), std::move(allocator), config);
+  auto scheduler = std::make_unique<EdfScheduler>(enclave, std::move(cpulist),
+                                                  std::move(allocator), config);
   return scheduler;
 }
 
@@ -826,7 +827,7 @@ void GlobalSatAgent::AgentThread() {
   PeriodicEdge debug_out(absl::Seconds(1));
 
   while (!Finished()) {
-    StatusWord::BarrierToken agent_barrier = status_word().barrier();
+    BarrierToken agent_barrier = status_word().barrier();
     // Check if we're assigned as the Global agent.
     if (cpu().id() != global_scheduler_->GetGlobalCPUId()) {
       RunRequest* req = enclave()->GetRunRequest(cpu());

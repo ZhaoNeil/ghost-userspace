@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "experiments/antagonist/orchestrator.h"
 
@@ -21,8 +13,8 @@ namespace ghost_test {
 std::ostream& operator<<(std::ostream& os,
                          const Orchestrator::Options& options) {
   os << "cpus:";
-  for (int i = 0; i < options.cpus.size(); i++) {
-    os << " " << options.cpus[i];
+  for (const ghost::Cpu& cpu : options.cpus) {
+    os << " " << cpu.id();
   }
   os << std::endl;
   os << "experiment_duration: " << options.experiment_duration << std::endl;
@@ -48,9 +40,7 @@ Orchestrator::Orchestrator(Options opts)
       thread_pool_(opts.num_threads) {
   CHECK_GE(options_.work_share, 0.0);
   CHECK_LE(options_.work_share, 1.0);
-  for (int cpu : options_.cpus) {
-    CHECK_NE(cpu, kBackgroundThreadCpu);
-  }
+  CHECK(!options_.cpus.IsSet(kBackgroundThreadCpu));
 }
 
 // C++ requires pure virtual destructors to have a definition.

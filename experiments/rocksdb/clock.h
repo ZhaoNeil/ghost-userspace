@@ -1,23 +1,14 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_EXPERIMENTS_ROCKSDB_CLOCK_H_
 #define GHOST_EXPERIMENTS_ROCKSDB_CLOCK_H_
 
 #include "absl/time/clock.h"
+#include "lib/base.h"
 
 // This is a pure virtual parent class that represents a clock.
 class Clock {
@@ -31,15 +22,15 @@ class Clock {
 inline Clock::~Clock() {}
 
 // This represents a real clock that returns the current time from
-// `absl::Now()`.
+// `ghost::MonotonicNow()`.
 //
 // Example:
 // RealClock clock;
 // absl::Time now = clock.TimeNow();
 class RealClock final : public Clock {
  public:
-  // Returns the current time (from `absl::Now()`).
-  absl::Time TimeNow() const final { return absl::Now(); }
+  // Returns the current time (from `ghost::MonotonicNow()`).
+  absl::Time TimeNow() const final { return ghost::MonotonicNow(); }
 };
 
 // This represents a simulated clock whose time can be arbitrarily changed. This
@@ -48,7 +39,7 @@ class RealClock final : public Clock {
 //
 // Example:
 // SimulatedClock clock;
-// clock.SetTime(absl::Now());
+// clock.SetTime(ghost::MonotonicNow());
 // clock.AdvanceTime(absl::Minutes(10));
 // absl::Time time = clock.TimeNow();
 // (`time` is equal to the time about 10 minutes from now.)

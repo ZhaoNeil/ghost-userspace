@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "shared/prio_table.h"
 
@@ -33,8 +25,8 @@ static size_t shmem_size(uint32_t sched_items, uint32_t work_classes,
   // starts on a new cacheline
   // The three structs above are each aligned to a cacheline, so this check
   // should succeed
-  CHECK_ZERO(sz % ABSL_CACHELINE_SIZE);
-  sz += sizeof(struct ghost::PrioTable::stream) +
+  CHECK_EQ(sz % ABSL_CACHELINE_SIZE, 0);
+  sz += sizeof(struct PrioTable::stream) +
         sizeof(std::atomic<int>) * stream_capacity;
 
   return sz;
@@ -61,7 +53,7 @@ PrioTable::PrioTable(uint32_t num_items, uint32_t num_classes,
   // Check that the stream starts on an address aligned to the cacheline size
   // The header, sched items, and work classes are each aligned to a cacheline,
   // so this check should succeed
-  CHECK_ZERO(hdr()->st_off % ABSL_CACHELINE_SIZE);
+  CHECK_EQ(hdr()->st_off % ABSL_CACHELINE_SIZE, 0);
 
   std::atomic<int>* entries = stream()->entries;
   for (uint32_t i = 0; i < hdr()->st_cap; i++) {
@@ -85,10 +77,9 @@ bool PrioTable::Attach(pid_t remote) {
 
 PrioTable::~PrioTable() {}
 
-struct ghost::PrioTable::stream* PrioTable::stream() {
+struct PrioTable::stream* PrioTable::stream() {
   char* bytes = reinterpret_cast<char*>(hdr_);
-  return reinterpret_cast<struct ghost::PrioTable::stream*>(bytes +
-                                                            hdr()->st_off);
+  return reinterpret_cast<struct PrioTable::stream*>(bytes + hdr()->st_off);
 }
 
 void PrioTable::MarkUpdatedIndex(int idx, int num_retries) {

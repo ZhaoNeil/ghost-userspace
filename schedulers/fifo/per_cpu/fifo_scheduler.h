@@ -1,23 +1,14 @@
-/*
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright 2021 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #ifndef GHOST_SCHEDULERS_FIFO_FIFO_SCHEDULER_H
 #define GHOST_SCHEDULERS_FIFO_FIFO_SCHEDULER_H
 
 #include <deque>
+#include <memory>
 
 #include "lib/agent.h"
 #include "lib/scheduler.h"
@@ -109,8 +100,6 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
     return cs->run_queue.Empty();
   }
 
-  void ValidatePreExitState();
-
   void DumpState(const Cpu& cpu, int flags) final;
   std::atomic<bool> debug_runqueue_ = false;
 
@@ -137,17 +126,17 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   void TaskSwitchto(FifoTask* task, const Message& msg) final;
 
  private:
-  void FifoSchedule(const Cpu& cpu, StatusWord::BarrierToken agent_barrier,
+  void FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                     bool prio_boosted);
   void TaskOffCpu(FifoTask* task, bool blocked, bool from_switchto);
   void TaskOnCpu(FifoTask* task, Cpu cpu);
-  void Migrate(FifoTask* task, Cpu cpu, StatusWord::BarrierToken seqnum);
+  void Migrate(FifoTask* task, Cpu cpu, BarrierToken seqnum);
   Cpu AssignCpu(FifoTask* task);
   void DumpAllTasks();
 
   struct CpuState {
     FifoTask* current = nullptr;
-    std::unique_ptr<ghost::LocalChannel> channel = nullptr;
+    std::unique_ptr<Channel> channel = nullptr;
     FifoRq run_queue;
   } ABSL_CACHELINE_ALIGNED;
 
@@ -160,7 +149,7 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   }
 
   CpuState cpu_states_[MAX_CPUS];
-  LocalChannel* default_channel_ = nullptr;
+  Channel* default_channel_ = nullptr;
 };
 
 std::unique_ptr<FifoScheduler> MultiThreadedFifoScheduler(Enclave* enclave,
@@ -188,12 +177,11 @@ class FullFifoAgent : public FullAgent<EnclaveType> {
   }
 
   ~FullFifoAgent() override {
-    scheduler_->ValidatePreExitState();
     this->TerminateAgentTasks();
   }
 
   std::unique_ptr<Agent> MakeAgent(const Cpu& cpu) override {
-    return absl::make_unique<FifoAgent>(&this->enclave_, cpu, scheduler_.get());
+    return std::make_unique<FifoAgent>(&this->enclave_, cpu, scheduler_.get());
   }
 
   void RpcHandler(int64_t req, const AgentRpcArgs& args,

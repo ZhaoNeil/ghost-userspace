@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "lib/base.h"
 
@@ -21,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -32,11 +25,24 @@
 #include "absl/container/node_hash_map.h"
 #include "absl/debugging/stacktrace.h"
 #include "absl/debugging/symbolize.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
-#include "kernel/ghost_uapi.h"
+#include "absl/time/time.h"
 #include "lib/logging.h"
 
+// procfs may have been mounted somewhere other than root (eg. for testing
+// purposes).
+ABSL_FLAG(std::string, ghost_procfs_prefix, "", "procfs prefix");
+
+ABSL_FLAG(bool, emit_fork_warnings, true,
+          "Print info about multiple threads in ForkedProcess");
+
 namespace ghost {
+
+std::string GetProc(const std::string& procfs_path) {
+  static std::string procfs_prefix = absl::GetFlag(FLAGS_ghost_procfs_prefix);
+  return absl::StrCat(procfs_prefix, "/proc/", procfs_path);
+}
 
 Notification::~Notification() {
   CHECK_NE(notified_.load(std::memory_order_relaxed), NotifiedState::kWaiter);
@@ -86,7 +92,7 @@ void Notification::WaitForNotification() {
 int ghost_tid_seqnum_bits() {
   static const int num_bits = [] {
     int pid_max_max;
-    std::ifstream ifs("/proc/sys/kernel/pid_max_max");
+    std::ifstream ifs(GetProc("sys/kernel/pid_max_max"));
     if (!ifs) {
       // We must be running on a kernel that predates 'kernel.pid_max_max'
       // in which case we assume that PID_MAX_LIMIT is 4194304.
@@ -111,18 +117,20 @@ int64_t GetGtidFromFile(FILE *stream) {
   return gtid;
 }
 
-int64_t gtid(int64_t pid) {
-  int64_t gtid = -1;
-  FILE *stream =
-      fopen(absl::StrCat("/proc/", pid, "/ghost/gtid").c_str(), "r");
+absl::StatusOr<int64_t> gtid(int64_t pid) {
+  FILE* stream = fopen(GetProc(absl::StrCat(pid, "/ghost/gtid")).c_str(), "r");
   if (stream) {
-    gtid = GetGtidFromFile(stream);
+    int64_t gtid = GetGtidFromFile(stream);
     fclose(stream);
+    if (gtid < 0) {
+      return absl::InvalidArgumentError(
+          absl::StrFormat("Unable to extract gtid for %lld", pid));
+    }
+    return gtid;
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Unable to open proc entry for %lld", pid));
   }
-  if (gtid < 0) {  // Fallback to syscall.
-    gtid = pid << ghost_tid_seqnum_bits();
-  }
-  return gtid;
 }
 
 int64_t GetTgidFromFile(FILE *stream) {
@@ -148,7 +156,7 @@ pid_t Gtid::tgid() const {
   int statusfd = -1, gtidfd = -1;
   FILE *status_stream = NULL, *gtid_stream = NULL;
 
-  int dirfd = open(absl::StrCat("/proc/", pid).c_str(), O_RDONLY);
+  int dirfd = open(GetProc(std::to_string(pid)).c_str(), O_RDONLY);
   if (dirfd < 0) {
     goto done;
   }
@@ -210,7 +218,7 @@ done:
 
 pid_t Gtid::tid() const { return gtid_raw_ >> ghost_tid_seqnum_bits(); }
 
-int64_t GetGtid() { return gtid(GetTID()); }
+absl::StatusOr<int64_t> GetGtid() { return gtid(GetTID()); }
 
 ABSL_CONST_INIT static absl::base_internal::SpinLock gtid_name_map_lock(
     absl::kConstInit, absl::base_internal::SCHEDULE_KERNEL_ONLY);
@@ -246,16 +254,43 @@ void Gtid::assign_name(std::string name) const {
 absl::string_view Gtid::describe() const {
   int64_t gtid = id();
 
-  // Describe special encodings.
+  // Describe special encodings. Ideally we would use mnemonics like
+  // GHOST_AGENT_GTID here but that requires including uapi header
+  // which is restricted to the ghost library.
   if (gtid <= 0) {
-    if (gtid == GHOST_NULL_GTID) return "<empty>";
+    switch (gtid) {
+      case 0:
+        return "<null>";
+      case -1:
+        return "<agent>";
+      case -2:
+        return "<idle>";
 
-    if (gtid == GHOST_AGENT_GTID) return "<agent>";
+      // In the unlikely case the uapi starts using the next 3 numbers
+      // let's encode the numerical value in the name (note that we cannot
+      // use absl::StrFormat to create this dynamically since this function
+      // returns a string_view).
+      case -3:
+        return "<gtid-3>";
+      case -4:
+        return "<gtid-4>";
+      case -5:
+        return "<gtid-5>";
 
-    return "<unknown>";
+      default:
+        return "<unknown>";
+    }
   }
 
   return get_gtid_name(gtid);
+}
+
+absl::StatusOr<Gtid> Gtid::FromTid(int64_t tid) {
+  absl::StatusOr<int64_t> gtid_or = gtid(tid);
+  if (!gtid_or.ok()) {
+    return gtid_or.status();
+  }
+  return Gtid(gtid_or.value());
 }
 
 static std::string DecodeAddr(void* addr) {
@@ -279,6 +314,20 @@ void PrintBacktrace(FILE* f, void* uctx) {
   }
 }
 
+bool CapHas(cap_value_t cap) {
+  cap_t caps = cap_get_proc();
+  if (!caps) {
+    return false;
+  }
+  cap_flag_value_t set_or_clr;
+  int err = cap_get_flag(caps, cap, CAP_EFFECTIVE, &set_or_clr);
+  cap_free(caps);
+  if (err) {
+    return false;
+  }
+  return set_or_clr == CAP_SET;
+}
+
 void Exit(int code) {
   if (code != 0) {
     std::cerr << "PID " << Gtid::Current().tid() << " Backtrace:" << std::endl;
@@ -297,11 +346,17 @@ void SpinFor(absl::Duration remaining) {
   while (remaining > absl::ZeroDuration()) {
     // We use MonotonicNow instead of absl::Now(), since the latter can acquire
     // a lock and sleep.
-    absl::Time start = ghost::MonotonicNow();
+    absl::Time start = MonotonicNow();
     absl::Duration delta;
 
     for (int i = 0; i < 100; ++i) {
-      delta = ghost::MonotonicNow() - start;
+      delta = MonotonicNow() - start;
+
+      // If clock_gettime is slow, we don't want to mistake that for a
+      // preemption.
+      if (delta > absl::Microseconds(10)) {
+        break;
+      }
     }
 
     // Don't count preempted time; if we were off cpu, the large delta
@@ -361,10 +416,34 @@ void ForkedProcess::HandleSigchild(int signum) {
   }
 }
 
+void CheckForMultiThreaded(void) {
+  std::error_code ec;
+  auto f = std::filesystem::directory_iterator("/proc/self/task/", ec);
+  auto end = std::filesystem::directory_iterator();
+  std::string me = std::to_string(GetTID());
+  for ( ; !ec && f != end; f.increment(ec)) {
+    std::string tid = f->path().filename();
+    if (tid == me) {
+      continue;
+    }
+    std::ifstream ifs_comm((f->path() / "comm").string());
+    std::string comm;
+    std::getline(ifs_comm, comm);
+    absl::FPrintF(stderr, "Fork danger!  Found extra task %s %s\n", tid, comm);
+  }
+}
+
 ForkedProcess::ForkedProcess(int stderr_fd) {
   pid_t ppid = getpid();
-  pid_t p = fork();
+  pid_t p;
 
+  // Any extra threads that exist when making a ForkedProcess are potentially a
+  // risk: they will not be forked, and your application may depend on them.
+  if (absl::GetFlag(FLAGS_emit_fork_warnings)) {
+    CheckForMultiThreaded();
+  }
+
+  p = fork();
   CHECK_GE(p, 0);
 
   if (p == 0) {

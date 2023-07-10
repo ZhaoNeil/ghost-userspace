@@ -1,9 +1,9 @@
 #include <stdio.h>
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
-#include "absl/synchronization/barrier.h"
 #include "lib/base.h"
 #include "lib/ghost.h"
 
@@ -28,9 +28,8 @@ void SimpleExp() {
     fprintf(stderr, "fantastic nap!\n");
     // Verify that a ghost thread implicitly clones itself in the ghost
     // scheduling class.
-    std::thread t2([] {
-      CHECK_EQ(sched_getscheduler(/*pid=*/0), SCHED_GHOST);
-    });
+    std::thread t2(
+        [] { CHECK_EQ(sched_getscheduler(/*pid=*/0), SCHED_GHOST); });
     t2.join();
   });
 
@@ -49,9 +48,8 @@ void SimpleExpMany(int num_threads) {
 
           // Verify that a ghost thread implicitly clones itself in the ghost
           // scheduling class.
-          std::thread t([] {
-            CHECK_EQ(sched_getscheduler(/*pid=*/0), SCHED_GHOST);
-          });
+          std::thread t(
+              [] { CHECK_EQ(sched_getscheduler(/*pid=*/0), SCHED_GHOST); });
           t.join();
 
           absl::SleepFor(absl::Milliseconds(10));
@@ -63,16 +61,20 @@ void SimpleExpMany(int num_threads) {
 
 void SpinFor(absl::Duration d) {
   while (d > absl::ZeroDuration()) {
-    absl::Time a = ghost::MonotonicNow();
+    absl::Time a = MonotonicNow();
     absl::Time b;
 
     // Try to minimize the contribution of arithmetic/Now() overhead.
-    for (int i = 0; i < 150; i++) b = ghost::MonotonicNow();
+    for (int i = 0; i < 150; i++) {
+      b = MonotonicNow();
+    }
 
     absl::Duration t = b - a;
 
     // Don't count preempted time
-    if (t < absl::Microseconds(100)) d -= t;
+    if (t < absl::Microseconds(100)) {
+      d -= t;
+    }
   }
 }
 
@@ -128,42 +130,16 @@ void TaskDepartedMany(int num_threads) {
 }
 
 void TaskDepartedManyRace(int num_threads) {
-  constexpr size_t kNumIterations = 20;
-  for (size_t i = 0; i < kNumIterations; i++) {
-    // +1 to account for this main thread.
-    absl::Barrier wait(/*num_threads=*/num_threads + 1);
-    Notification exit;
-    std::vector<std::unique_ptr<GhostThread>> threads;
-
-    threads.reserve(num_threads);
-    for (int j = 0; j < num_threads; j++) {
-      threads.emplace_back(
-          new GhostThread(GhostThread::KernelScheduler::kGhost, [&wait, &exit] {
-            wait.Block();
-            // Get the scheduler to open and commit txns frequently.
-            while (!exit.HasBeenNotified()) {
-              absl::SleepFor(absl::Nanoseconds(1));
-            }
-          }));
-    }
-
-    wait.Block();
-    // Give the ghOSt threads time to wake up and the scheduler a moment to
-    // start scheduling them.
-    absl::SleepFor(absl::Milliseconds(10));
-    for (auto& t : threads) {
+  RemoteThreadTester().Run(
+    [] {  // ghost threads
+      absl::SleepFor(absl::Nanoseconds(1));
+    },
+    [](GhostThread* t) {  // remote, per-thread work
       const sched_param param{};
       CHECK_EQ(sched_setscheduler(t->tid(), SCHED_OTHER, &param), 0);
       CHECK_EQ(sched_getscheduler(t->tid()), SCHED_OTHER);
     }
-    // Wait a little while so that the race is hopefully triggered while we
-    // wait.
-    absl::SleepFor(absl::Milliseconds(10));
-    exit.Notify();
-    for (auto& t : threads) {
-      t->Join();
-    }
-  }
+  );
 }
 
 }  // namespace

@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "topology.h"
 
@@ -23,14 +15,13 @@
 #include <thread>
 
 #include "absl/strings/str_format.h"
-#include "lib/ghost.h"
 #include <numa.h>
 
 namespace ghost {
 
-CpuList::CpuList(const Topology& topology)
+CpuMap::CpuMap(const Topology& topology)
     : topology_(&topology),
-      map_size_((topology_->num_cpus() + kIntsBits - 1) / kIntsBits) {
+      map_size_((topology.num_cpus() + kIntsBits - 1) / kIntsBits) {
   static_assert(MAX_CPUS % kIntsBits == 0);
   CHECK_LE(map_size_, kMapCapacity);
 }
@@ -56,44 +47,44 @@ Cpu CpuList::GetNthCpu(uint32_t n) const {
   return Cpu(Cpu::UninitializedType::kUninitialized);
 }
 
-void CpuList::Iter::FindNextSetBit() {
+void CpuMap::Iter::FindNextSetBit() {
   uint32_t map_idx = id_ / kIntsBits;
   const size_t bit_offset = id_ & (kIntsBits - 1);
   uint64_t word = 0;
 
-  if (map_idx >= map_size_) {
+  if (map_idx >= map_->map_size_) {
     // We are already past the end of the bitmap, so skip to the end to
     // avoid an out-of-bounds access to `bitmap_` below.
     goto end;
   }
   // Reset all LSBs seen so far. Note that since `kIntsBits` is a power of
   // 2, the AND operation below is equivalent to `id_ % kIntsBits`.
-  word = bitmap_[map_idx];
+  word = map_->GetNthMap(map_idx);
   word &= ~0ULL << bit_offset;
-  while (map_idx < map_size_) {
+  while (map_idx < map_->map_size_) {
     if (word) {
       id_ = map_idx * kIntsBits + __builtin_ctzll(word);
-      cpu_ = topology_->cpu(id_);
+      cpu_ = map_->topology().cpu(id_);
       return;
     }
-    if (++map_idx < map_size_) {
-      word = bitmap_[map_idx];
+    if (++map_idx < map_->map_size_) {
+      word = map_->GetNthMap(map_idx);
     }
   }
 
 end:
   // Since there are no more bits set, then fast forward to the `end` Iter
   // to bail out of range based for-loops.
-  id_ = topology_->num_cpus();
+  id_ = map_->topology().num_cpus();
   cpu_ = Cpu(Cpu::UninitializedType::kUninitialized);
 }
 
-CpuList::Iter CpuList::begin() const {
-  return Iter(*topology_, bitmap_, map_size_, /*id=*/0);
+CpuMap::Iter CpuMap::begin() const {
+  return Iter(this, /*id=*/0);
 }
 
-CpuList::Iter CpuList::end() const {
-  return Iter(*topology_, bitmap_, map_size_, /*id=*/topology_->num_cpus());
+CpuMap::Iter CpuMap::end() const {
+  return Iter(this, /*id=*/topology_->num_cpus());
 }
 
 absl::flat_hash_map<int, CpuList> Topology::GetAllSiblings(

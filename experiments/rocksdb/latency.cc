@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "experiments/rocksdb/latency.h"
 
@@ -224,14 +216,16 @@ void Print(const std::vector<Request>& requests, absl::Duration runtime,
     PrintPrettyPreface(options);
   }
 
-  HANDLE_STAGE("Ingress Queue Time", requests, runtime, request_generated,
-               request_received, options);
-  HANDLE_STAGE("Repeatable Handle Time", requests, runtime, request_received,
-               request_assigned, options);
-  HANDLE_STAGE("Worker Queue Time", requests, runtime, request_assigned,
-               request_start, options);
-  HANDLE_STAGE("Worker Handle Time", requests, runtime, request_start,
-               request_finished, options);
+  if (!options.print_last) {
+    HANDLE_STAGE("Ingress Queue Time", requests, runtime, request_generated,
+                 request_received, options);
+    HANDLE_STAGE("Repeatable Handle Time", requests, runtime, request_received,
+                 request_assigned, options);
+    HANDLE_STAGE("Worker Queue Time", requests, runtime, request_assigned,
+                 request_start, options);
+    HANDLE_STAGE("Worker Handle Time", requests, runtime, request_start,
+                 request_finished, options);
+  }
   // Total time in system
   HANDLE_STAGE("Total", requests, runtime, request_generated, request_finished,
                options);

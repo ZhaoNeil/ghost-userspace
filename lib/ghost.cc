@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "ghost.h"
 
@@ -37,11 +29,22 @@
 // conflict, we need to name our verbose flag differently outside of Google.
 //
 // All internal Google binaries have a `v` flag by default. To be consistent
-// with our open source project, we instead use the `verbose` flag internally,
-// too.
+// with our open source project, we can use the `verbose` flag internally too
+// as an alias.
 ABSL_FLAG(int32_t, verbose, 0, "Verbosity level");
 
+// This flag is manually parsed on startup (see CheckVersion()), not within
+// absl::ParseCommandLine(). We have it here as an ABSL_FLAG just for
+// documentation reasons.
+ABSL_FLAG(bool, ghost_version, false, "Print UAPI ghOSt version and quit.");
+
 namespace ghost {
+
+namespace {
+
+Ghost* ghost_helper_ptr = new Ghost;
+
+}  // namespace
 
 LocalStatusWordTable::LocalStatusWordTable(int enclave_fd, int id,
                                            int numa_node) {
@@ -74,7 +77,7 @@ LocalStatusWordTable::~LocalStatusWordTable() {
 }
 
 static ghost_status_word* status_word_from_info(ghost_sw_info* sw_info) {
-  StatusWordTable* table = Ghost::GetGlobalStatusWordTable();
+  StatusWordTable* table = GhostHelper()->GetGlobalStatusWordTable();
   CHECK_EQ(sw_info->id, table->id());
   return table->get(sw_info->index);
 }
@@ -93,7 +96,9 @@ StatusWord::~StatusWord() {
 }
 
 LocalStatusWord::LocalStatusWord(StatusWord::AgentSW) {
-  CHECK_ZERO(Ghost::GetStatusWordInfo(GHOST_AGENT, sched_getcpu(), &sw_info_));
+  CHECK_EQ(
+      GhostHelper()->GetStatusWordInfo(GHOST_AGENT, sched_getcpu(), sw_info_),
+      0);
   sw_ = status_word_from_info(&sw_info_);
   owner_ = Gtid::Current();
 }
@@ -117,7 +122,7 @@ void LocalStatusWord::Free() {
   CHECK(!empty());
   CHECK(can_free());
 
-  CHECK_EQ(Ghost::FreeStatusWordInfo(&sw_info_), 0);
+  CHECK_EQ(GhostHelper()->FreeStatusWordInfo(sw_info_), 0);
   sw_ = nullptr;
   owner_ = Gtid(0);
 }
@@ -125,7 +130,7 @@ void LocalStatusWord::Free() {
 // static
 bool Ghost::GhostIsMountedAt(const char* path) {
   bool ret = false;
-  FILE* mounts = setmntent("/proc/self/mounts", "r");
+  FILE* mounts = setmntent(GetProc("self/mounts").c_str(), "r");
   CHECK_NE(mounts, nullptr);
 
   mntent* ent;
@@ -141,7 +146,7 @@ bool Ghost::GhostIsMountedAt(const char* path) {
 
 // static
 void Ghost::MountGhostfs() {
-  if (mount("ghost", Ghost::kGhostfsMount, "ghost", 0, nullptr)) {
+  if (mount("ghost", kGhostfsMount, "ghost", 0, nullptr)) {
     // EBUSY means it is already mounted. Anything else is failure. This CHECK
     // is generally triggered when you forget to compile ghOSt into the kernel,
     // such as by neglecting to set the Linux config option
@@ -150,13 +155,13 @@ void Ghost::MountGhostfs() {
   }
 }
 
-// Returns the ghOSt abi versions supported by the kernel.
 // static
+// Returns the ghOSt abi versions supported by the kernel.
 int Ghost::GetSupportedVersions(std::vector<uint32_t>& versions) {
-  if (!GhostIsMountedAt(Ghost::kGhostfsMount)) {
+  if (!GhostIsMountedAt(kGhostfsMount)) {
     MountGhostfs();
   }
-  std::ifstream ver(absl::StrCat(Ghost::kGhostfsMount, "/version"));
+  std::ifstream ver(absl::StrCat(kGhostfsMount, "/version"));
   if (!ver.is_open()) {
     return -1;
   }
@@ -173,13 +178,6 @@ int Ghost::GetSupportedVersions(std::vector<uint32_t>& versions) {
   return 0;
 }
 
-// static
-int Ghost::gbl_ctl_fd_ = -1;
-int Ghost::gbl_dir_fd_ = -1;
-// static
-StatusWordTable* Ghost::gbl_sw_table_;
-
-// static
 void Ghost::InitCore() {
   Gtid::Current().assign_name("main");
   GhostSignals::Init();
@@ -189,6 +187,56 @@ void Ghost::InitCore() {
 
   // We make assumptions around MAX_CPUS being a power of 2 in Topology.
   static_assert((MAX_CPUS & (MAX_CPUS - 1)) == 0);
+}
+
+int Ghost::SchedTaskEnterGhost(int64_t pid, int dir_fd) {
+  if (dir_fd == -1) {
+    dir_fd = GhostHelper()->GetGlobalEnclaveDirFd();
+  }
+  // If the open/close of tasks is a performance problem, we can have the caller
+  // open it for us.
+  int tasks_fd = openat(dir_fd, "tasks", O_WRONLY);
+  if (tasks_fd < 0) {
+    return -1;
+  }
+  std::string pid_s = std::to_string(pid);
+  int ret = 0;
+  if (write(tasks_fd, pid_s.c_str(), pid_s.length()) != pid_s.length()) {
+    ret = -1;
+  }
+  int old_errno = errno;
+  close(tasks_fd);
+  errno = old_errno;
+  // We used to "Trust but verify" that pid was in ghost.  However, it's
+  // possible that the syscall succeeded, but the enclave was immediately
+  // destroyed, and our task is back in CFS already.
+  return ret;
+}
+
+int Ghost::SchedTaskEnterGhost(const Gtid& gtid, int dir_fd) {
+  return SchedTaskEnterGhost(gtid.id(), dir_fd);
+}
+
+int Ghost::SchedAgentEnterGhost(int ctl_fd, const Cpu& cpu, int queue_fd) {
+  std::string cmd = absl::StrCat("become agent ", cpu.id(), " ", queue_fd);
+  ssize_t ret = write(ctl_fd, cmd.c_str(), cmd.length());
+  if (ret == cmd.length()) {
+    CpuList agent_affinity = MachineTopology()->EmptyCpuList();
+    // Verify sched_class.
+    CHECK_EQ(sched_getscheduler(0), SCHED_GHOST | SCHED_RESET_ON_FORK);
+
+    // Verify cpu affinity.
+    CHECK_EQ(SchedGetAffinity(Gtid::Current(), agent_affinity), 0);
+    CHECK_EQ(agent_affinity.Size(), 1);
+    CHECK(agent_affinity.IsSet(cpu));
+
+    // Verify that we are running on the agent cpu (probably overkill
+    // given the affinity check above).
+    CHECK_EQ(sched_getcpu(), cpu.id());
+
+    return 0;
+  }
+  return ret;
 }
 
 // static
@@ -241,40 +289,6 @@ void GhostSignals::AddHandler(int signal, std::function<bool(int)> handler) {
   handlers_[signal].push_back(std::move(handler));
 }
 
-int SchedTaskEnterGhost(pid_t pid, int dir_fd) {
-  if (dir_fd == -1) {
-    dir_fd = Ghost::GetGlobalEnclaveDirFd();
-  }
-  // If the open/close of tasks is a performance problem, we can have the caller
-  // open it for us.
-  int tasks_fd = openat(dir_fd, "tasks", O_WRONLY);
-  if (tasks_fd < 0) {
-    return -1;
-  }
-  std::string pid_s = std::to_string(pid);
-  int ret = 0;
-  if (write(tasks_fd, pid_s.c_str(), pid_s.length()) != pid_s.length()) {
-    ret = -1;
-  }
-  int old_errno = errno;
-  close(tasks_fd);
-  errno = old_errno;
-  // We used to "Trust but verify" that pid was in ghost.  However, it's
-  // possible that the syscall succeeded, but the enclave was immediately
-  // destroyed, and our task is back in CFS already.
-  return ret;
-}
-
-int SchedAgentEnterGhost(int ctl_fd, int queue_fd) {
-  std::string cmd = absl::StrCat("become agent ", queue_fd);
-  ssize_t ret = write(ctl_fd, cmd.c_str(), cmd.length());
-  if (ret == cmd.length()) {
-    CHECK_EQ(sched_getscheduler(0), SCHED_GHOST | SCHED_RESET_ON_FORK);
-    return 0;
-  }
-  return ret;
-}
-
 // Returns the ctlfd and dirfd for some enclave that is accepting tasks.
 struct ctl_dir {
   int ctl;
@@ -282,7 +296,8 @@ struct ctl_dir {
 };
 static ctl_dir FindActiveEnclave() {
   std::error_code ec;
-  auto f = std::filesystem::directory_iterator(Ghost::kGhostfsMount, ec);
+  auto f =
+      std::filesystem::directory_iterator(GhostHelper()->kGhostfsMount, ec);
   auto end = std::filesystem::directory_iterator();
   for (/* f */; !ec && f != end; f.increment(ec)) {
     if (std::regex_match(f->path().filename().string(),
@@ -304,18 +319,22 @@ static ctl_dir FindActiveEnclave() {
   return {-1, -1};
 }
 
-GhostThread::GhostThread(KernelScheduler ksched, std::function<void()> work)
+GhostThread::GhostThread(KernelScheduler ksched, std::function<void()> work,
+                         int dir_fd)
     : ksched_(ksched) {
   GhostThread::SetGlobalEnclaveFdsOnce();
 
-  thread_ = std::thread([this, w = std::move(work)] {
+  // `dir_fd` must only be set when the scheduler is ghOSt.
+  CHECK(ksched == KernelScheduler::kGhost || dir_fd == -1);
+
+  thread_ = std::thread([this, w = std::move(work), dir_fd] {
     tid_ = GetTID();
     gtid_ = Gtid::Current();
 
     started_.Notify();
 
     if (ksched_ == KernelScheduler::kGhost) {
-      const int ret = SchedTaskEnterGhost(/*pid=*/0);
+      const int ret = GhostHelper()->SchedTaskEnterGhost(/*pid=*/0, dir_fd);
       CHECK_EQ(ret, 0);
     }
     std::move(w)();
@@ -325,6 +344,41 @@ GhostThread::GhostThread(KernelScheduler ksched, std::function<void()> work)
 
 GhostThread::~GhostThread() { CHECK(!thread_.joinable()); }
 
+void RemoteThreadTester::Run(std::function<void()> thread_work,
+                             std::function<void(GhostThread*)> remote_work) {
+  for (int i = 0; i < num_threads_; ++i) {
+    threads_.push_back(std::make_unique<GhostThread>(
+        GhostThread::KernelScheduler::kGhost,
+        [this, thread_work] {
+          num_threads_at_barrier_.fetch_add(1, std::memory_order_relaxed);
+          start_.WaitForNotification();
+
+          do {
+            thread_work();
+          } while (!exit_.HasBeenNotified());
+        }));
+  }
+
+  while (num_threads_at_barrier_.load(std::memory_order_relaxed) <
+         num_threads_) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  start_.Notify();
+
+  // Give the ghOSt threads time to wake up and the scheduler a moment to
+  // start scheduling them.
+  absl::SleepFor(absl::Milliseconds(10));
+
+  for (auto& t : threads_) {
+    remote_work(t.get());
+  }
+
+  exit_.Notify();
+
+  for (auto& t : threads_) {
+    t->Join();
+  }
+}
 // Agents should have already set the global enclave fd before creating agent
 // tasks, so this helper is used by clients to find an enclave to join.
 //
@@ -341,13 +395,26 @@ GhostThread::~GhostThread() { CHECK(!thread_.joinable()); }
 void GhostThread::SetGlobalEnclaveFdsOnce() {
   static absl::Mutex mtx(absl::kConstInit);
   absl::MutexLock lock(&mtx);
-  if (Ghost::GetGlobalEnclaveCtlFd() == -1) {
-    CHECK_EQ(Ghost::GetGlobalEnclaveDirFd(), -1);
+  if (GhostHelper()->GetGlobalEnclaveCtlFd() == -1) {
+    CHECK_EQ(GhostHelper()->GetGlobalEnclaveDirFd(), -1);
     ctl_dir cd = FindActiveEnclave();
     if (cd.ctl >= 0) {
-      Ghost::SetGlobalEnclaveFds(cd.ctl, cd.dir);
+      GhostHelper()->SetGlobalEnclaveFds(cd.ctl, cd.dir);
     }
   }
+}
+
+Ghost* GhostHelper() {
+  CHECK_NE(ghost_helper_ptr, nullptr);
+  return ghost_helper_ptr;
+}
+
+void UpdateGhostHelper(Ghost* ghost_helper) {
+  CHECK_NE(ghost_helper, nullptr);
+  if (ghost_helper_ptr) {
+    delete ghost_helper_ptr;
+  }
+  ghost_helper_ptr = ghost_helper;
 }
 
 }  // namespace ghost

@@ -1,18 +1,12 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/fifo/per_cpu/fifo_scheduler.h"
+
+#include <memory>
 
 namespace ghost {
 
@@ -24,8 +18,8 @@ FifoScheduler::FifoScheduler(Enclave* enclave, CpuList cpulist,
     // TODO: extend Cpu to get numa node.
     int node = 0;
     CpuState* cs = cpu_state(cpu);
-    cs->channel = absl::make_unique<ghost::LocalChannel>(
-        GHOST_MAX_QUEUE_ELEMS, node, MachineTopology()->ToCpuList({cpu}));
+    cs->channel = enclave->MakeChannel(GHOST_MAX_QUEUE_ELEMS, node,
+                                       MachineTopology()->ToCpuList({cpu}));
     // This channel pointer is valid for the lifetime of FifoScheduler
     if (!default_channel_) {
       default_channel_ = cs->channel.get();
@@ -86,8 +80,7 @@ Cpu FifoScheduler::AssignCpu(FifoTask* task) {
   return next++;
 }
 
-void FifoScheduler::Migrate(FifoTask* task, Cpu cpu,
-                            StatusWord::BarrierToken seqnum) {
+void FifoScheduler::Migrate(FifoTask* task, Cpu cpu, BarrierToken seqnum) {
   CHECK_EQ(task->run_state, FifoTaskState::kRunnable);
   CHECK_EQ(task->cpu, -1);
 
@@ -222,12 +215,6 @@ void FifoScheduler::TaskSwitchto(FifoTask* task, const Message& msg) {
   TaskOffCpu(task, /*blocked=*/true, /*from_switchto=*/false);
 }
 
-void FifoScheduler::ValidatePreExitState() {
-  for (const Cpu& cpu : cpus()) {
-    CpuState* cs = cpu_state(cpu);
-    CHECK(cs->run_queue.Empty());
-  }
-}
 
 void FifoScheduler::TaskOffCpu(FifoTask* task, bool blocked,
                                bool from_switchto) {
@@ -259,8 +246,7 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   task->prio_boost = false;
 }
 
-void FifoScheduler::FifoSchedule(const Cpu& cpu,
-                                 StatusWord::BarrierToken agent_barrier,
+void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                                  bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
   FifoTask* next = nullptr;
@@ -324,7 +310,7 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu,
 }
 
 void FifoScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
-  StatusWord::BarrierToken agent_barrier = agent_sw.barrier();
+  BarrierToken agent_barrier = agent_sw.barrier();
   CpuState* cs = cpu_state(cpu);
 
   GHOST_DPRINT(3, stderr, "Schedule: agent_barrier[%d] = %d\n", cpu.id(),
@@ -391,8 +377,8 @@ void FifoRq::Erase(FifoTask* task) {
 std::unique_ptr<FifoScheduler> MultiThreadedFifoScheduler(Enclave* enclave,
                                                           CpuList cpulist) {
   auto allocator = std::make_shared<ThreadSafeMallocTaskAllocator<FifoTask>>();
-  auto scheduler = absl::make_unique<FifoScheduler>(enclave, std::move(cpulist),
-                                                    std::move(allocator));
+  auto scheduler = std::make_unique<FifoScheduler>(enclave, std::move(cpulist),
+                                                   std::move(allocator));
   return scheduler;
 }
 
@@ -431,10 +417,7 @@ std::ostream& operator<<(std::ostream& os, const FifoTaskState& state) {
       return os << "kQueued";
     case FifoTaskState::kOnCpu:
       return os << "kOnCpu";
-      // No default (exhaustive switch)
   }
-
-  return os << static_cast<int>(state);  // 'state' has a non-enumerator value.
 }
 
 }  //  namespace ghost

@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "shared/shmem.h"
 
@@ -49,9 +41,6 @@ namespace ghost {
 
 constexpr size_t kHugepageSize = 2 * 1024 * 1024;
 static const char* kMemFdPrefix = "ghost-shmem-";
-
-#define MFD_GOOGLE_SPECIFIC_BASE 0x0200U
-#define MFD_HUGEPAGE (MFD_GOOGLE_SPECIFIC_BASE << 0)
 
 // Please don't use "0" as a header version, it's not distinguishable from
 // an uninitialized header.
@@ -121,8 +110,8 @@ void GhostShmem::CreateShmem(int64_t client_version, const char* suffix,
   // Prepend our header to the mapping.
   map_size_ = roundup2(size + kHeaderReservedBytes, kHugepageSize);
   CHECK_LE(map_size_, UINT32_MAX);
-  CHECK_ZERO(ftruncate(memfd_, map_size_));
-  CHECK_ZERO(fcntl(memfd_, F_ADD_SEALS, MFD_SEALS));
+  CHECK_EQ(ftruncate(memfd_, map_size_), 0);
+  CHECK_EQ(fcntl(memfd_, F_ADD_SEALS, MFD_SEALS), 0);
 
   shmem_ =
       mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, memfd_, 0);
@@ -152,7 +141,7 @@ bool GhostShmem::ConnectShmem(int64_t client_version, const char* suffix,
   }
 
   struct stat sb;
-  CHECK_ZERO(fstat(memfd_, &sb));
+  CHECK_EQ(fstat(memfd_, &sb), 0);
 
   map_size_ = sb.st_size;
   shmem_ =
@@ -167,7 +156,7 @@ bool GhostShmem::ConnectShmem(int64_t client_version, const char* suffix,
   // on the same page.
   //
   // See b/173811264 for details.
-  CHECK_ZERO(mlock(shmem_, map_size_));
+  CHECK_EQ(mlock(shmem_, map_size_), 0);
 
   // Setup internal fields.
   hdr_ = static_cast<InternalHeader*>(shmem_);
@@ -226,8 +215,7 @@ GhostShmem* GhostShmem::GetShmemBlob(size_t size) {
   std::string blob = absl::StrCat(
       "blob-", std::to_string(unique.fetch_add(1, std::memory_order_relaxed)));
   // GhostShmem needs a unique name per process for the memfd
-  ghost::GhostShmem* shmem =
-      new ghost::GhostShmem(/* client_version = */ 0, blob.data(), size);
+  GhostShmem* shmem = new GhostShmem(/*client_version=*/0, blob.c_str(), size);
   shmem->MarkReady();
 
   return shmem;

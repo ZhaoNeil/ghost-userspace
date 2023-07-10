@@ -1,14 +1,23 @@
 # Note: If you modify this BUILD file, please contact jhumphri@ first to ensure
 # that you are not breaking the Copybara script.
 
+load("@rules_license//rules:license.bzl", "license")
 load("//:bpf/bpf.bzl", "bpf_skeleton")
 
-package(default_visibility = ["//:__pkg__"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//:__pkg__"],
+)
+
+license(
+    name = "license",
+    package_name = "ghost",
+)
 
 # Each license covers the code below:
 #
-# BSD 2: Just covers the IOVisor BCC code in third_party/iovisor_bcc/. This
-# code was not written by Google.
+# BSD 2-clause: Just covers the IOVisor BCC code in third_party/iovisor_bcc/.
+# This code was not written by Google.
 #
 # GPLv2: Just covers the eBPF code in third_party/bpf/. This code was written
 # by Google. We need to license it under GPLv2 though so that the eBPF code
@@ -17,15 +26,14 @@ package(default_visibility = ["//:__pkg__"])
 # MIT: Just covers third_party/util/util.h. This code was not written by Google,
 # but was modified by Google.
 #
-# Apache 2: All other code is covered by Apache 2. This includes the library
-# code in lib/, the experiments, all code in bpf/user/, etc.
+# BSD 3-clause: All other code is covered by BSD 3-clause. This includes the
+# library code in lib/, the experiments, all code in bpf/user/, etc.
 licenses(["notice"])
 
 exports_files(["LICENSE"])
 
 compiler_flags = [
     "-Wno-sign-compare",
-    "-DGHOST_LOGGING",
 ]
 
 bpf_linkopts = [
@@ -40,7 +48,6 @@ cc_library(
         "lib/agent.cc",
         "lib/channel.cc",
         "lib/enclave.cc",
-        "lib/topology.cc",
     ],
     hdrs = [
         "bpf/user/agent.h",
@@ -49,7 +56,6 @@ cc_library(
         "lib/channel.h",
         "lib/enclave.h",
         "lib/scheduler.h",
-        "lib/topology.h",
         "//third_party:iovisor_bcc/trace_helpers.h",
     ],
     copts = compiler_flags,
@@ -58,14 +64,31 @@ cc_library(
         ":base",
         ":ghost",
         ":shared",
+        ":topology",
+        ":trivial_status",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "@linux//:libbpf",
+    ],
+)
+
+cc_library(
+    name = "trivial_status",
+    srcs = ["lib/trivial_status.cc"],
+    hdrs = ["lib/trivial_status.h"],
+    copts = compiler_flags,
+    deps = [
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )
 
@@ -80,10 +103,38 @@ cc_binary(
     deps = [
         ":agent",
         ":base",
+        ":topology",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/numeric:int128",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "cfs_scheduler",
+    srcs = [
+        "schedulers/cfs/cfs_scheduler.cc",
+        "schedulers/cfs/cfs_scheduler.h",
+    ],
+    hdrs = [
+        "schedulers/cfs/cfs_scheduler.h",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        ":base",
+        ":topology",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/debugging:symbolize",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/numeric:int128",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
@@ -98,6 +149,7 @@ cc_binary(
     deps = [
         ":agent",
         ":edf_scheduler",
+        ":topology",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
@@ -135,6 +187,7 @@ cc_binary(
     deps = [
         ":agent",
         ":shinjuku_scheduler",
+        ":topology",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
@@ -165,6 +218,7 @@ cc_binary(
     deps = [
         ":agent",
         ":sol_scheduler",
+        ":topology",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
@@ -192,7 +246,22 @@ cc_binary(
     deps = [
         ":base",
         ":ghost",
-        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_binary(
+    name = "cfs_test",
+    testonly = 1,
+    srcs = [
+        "tests/cfs_test.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":base",
+        ":cfs_scheduler",
+        ":ghost",
+        ":topology",
+        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -209,6 +278,22 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "simple_cfs",
+    srcs = [
+        "tests/simple_cfs.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":base",
+        ":cfs_scheduler",
+        ":ghost",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 cc_test(
     name = "agent_test",
     size = "small",
@@ -220,6 +305,7 @@ cc_test(
         ":agent",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/random",
+        "@com_google_absl//absl/status",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -234,13 +320,37 @@ cc_test(
     deps = [
         ":agent",
         ":fifo_per_cpu_scheduler",
+        ":ghost",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/random",
+        "@com_google_absl//absl/status",
         "@com_google_googletest//:gtest_main",
     ],
 )
 
-# Makes vmlinux_ghost_*.h files visible to eBPF code.
-exports_files(glob(["kernel/vmlinux_ghost_*.h"]))
+exports_files(glob([
+    "kernel/vmlinux_ghost_*.h",
+]) + [
+    "lib/queue.bpf.h",
+])
+
+cc_library(
+    name = "topology",
+    srcs = [
+        "lib/topology.cc",
+    ],
+    hdrs = [
+        "lib/topology.h",
+    ],
+    copts = compiler_flags,
+    linkopts = ["-lnuma"],
+    deps = [
+        ":base",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
 
 cc_library(
     name = "base",
@@ -254,6 +364,7 @@ cc_library(
         "//third_party:util/util.h",
     ],
     copts = compiler_flags,
+    linkopts = ["-lcap"],
     deps = [
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
@@ -261,7 +372,12 @@ cc_library(
         "@com_google_absl//absl/container:node_hash_map",
         "@com_google_absl//absl/debugging:stacktrace",
         "@com_google_absl//absl/debugging:symbolize",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
     ],
@@ -290,6 +406,7 @@ cc_binary(
     deps = [
         ":agent",
         ":biff_scheduler",
+        ":topology",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
@@ -310,6 +427,7 @@ cc_library(
         "schedulers/biff/biff_bpf.skel.h",
         "schedulers/biff/biff_scheduler.h",
         "//third_party/bpf:biff_bpf.h",
+        "//third_party/bpf:topology.bpf.h",
     ],
     copts = compiler_flags,
     deps = [
@@ -322,6 +440,19 @@ cc_library(
 )
 
 cc_test(
+    name = "bpf_queue_test",
+    size = "small",
+    srcs = [
+        "lib/queue.bpf.h",
+        "tests/bpf_queue_test.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_test(
     name = "biff_test",
     size = "small",
     srcs = [
@@ -330,6 +461,61 @@ cc_test(
     copts = compiler_flags,
     deps = [
         ":biff_scheduler",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_binary(
+    name = "agent_cfs_bpf",
+    srcs = [
+        "schedulers/cfs_bpf/agent_cfs.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        ":cfs_bpf_scheduler",
+        ":topology",
+        "@com_google_absl//absl/debugging:symbolize",
+        "@com_google_absl//absl/flags:parse",
+    ],
+)
+
+bpf_skeleton(
+    name = "cfs_bpf_skel",
+    bpf_object = "//third_party/bpf:cfs_bpf",
+    skel_hdr = "schedulers/cfs_bpf/cfs_bpf.skel.h",
+)
+
+cc_library(
+    name = "cfs_bpf_scheduler",
+    srcs = [
+        "schedulers/cfs_bpf/cfs_scheduler.cc",
+    ],
+    hdrs = [
+        "lib/queue.bpf.h",
+        "schedulers/cfs_bpf/cfs_bpf.skel.h",
+        "schedulers/cfs_bpf/cfs_scheduler.h",
+        "//third_party/bpf:cfs_bpf.h",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:bind_front",
+        "@com_google_absl//absl/strings:str_format",
+        "@linux//:libbpf",
+    ],
+)
+
+cc_test(
+    name = "cfs_bpf_test",
+    size = "small",
+    srcs = [
+        "tests/cfs_bpf_test.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":cfs_bpf_scheduler",
         "@com_google_googletest//:gtest",
     ],
 )
@@ -439,6 +625,41 @@ cc_test(
 )
 
 cc_binary(
+    name = "fdcat",
+    srcs = [
+        "util/fdcat.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":shared",
+    ],
+)
+
+cc_binary(
+    name = "fdsrv",
+    srcs = [
+        "util/fdsrv.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":shared",
+    ],
+)
+
+cc_test(
+    name = "fd_server_test",
+    size = "small",
+    srcs = [
+        "tests/fd_server_test.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":shared",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
     name = "fifo_per_cpu_agent",
     srcs = [
         "schedulers/fifo/per_cpu/fifo_agent.cc",
@@ -476,6 +697,7 @@ cc_binary(
     deps = [
         ":agent",
         ":fifo_centralized_scheduler",
+        ":topology",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
@@ -498,24 +720,82 @@ cc_library(
     ],
 )
 
+cc_binary(
+    name = "agent_flux",
+    srcs = [
+        "schedulers/flux/agent_flux.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        ":flux_scheduler",
+        ":topology",
+        "@com_google_absl//absl/debugging:symbolize",
+        "@com_google_absl//absl/flags:parse",
+    ],
+)
+
+bpf_skeleton(
+    name = "flux_bpf_skel",
+    bpf_object = "//third_party/bpf:flux_bpf",
+    skel_hdr = "schedulers/flux/flux_bpf.skel.h",
+)
+
+cc_library(
+    name = "flux_scheduler",
+    srcs = [
+        "schedulers/flux/flux_scheduler.cc",
+    ],
+    hdrs = [
+        "lib/queue.bpf.h",
+        "schedulers/flux/flux_bpf.skel.h",
+        "schedulers/flux/flux_scheduler.h",
+        "//third_party/bpf:flux_bpf.h",
+        "//third_party/bpf:flux_infra",
+        "//third_party/bpf:flux_scheds",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:bind_front",
+        "@com_google_absl//absl/strings:str_format",
+        "@linux//:libbpf",
+    ],
+)
+
+cc_test(
+    name = "flux_test",
+    size = "small",
+    srcs = [
+        "tests/flux_test.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":flux_scheduler",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
 cc_library(
     name = "ghost",
     srcs = [
         "lib/ghost.cc",
-        "lib/topology.cc",
     ],
     hdrs = [
         "kernel/ghost_uapi.h",
         "lib/ghost.h",
-        "lib/topology.h",
     ],
     copts = compiler_flags,
     linkopts = ["-lnuma"],
     deps = [
         ":base",
+        ":topology",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
     ],
 )
@@ -536,17 +816,23 @@ cc_test(
 cc_library(
     name = "shared",
     srcs = [
+        "shared/fd_server.cc",
         "shared/prio_table.cc",
         "shared/shmem.cc",
     ],
     hdrs = [
+        "shared/fd_server.h",
         "shared/prio_table.h",
         "shared/shmem.h",
     ],
     copts = compiler_flags,
     deps = [
         ":base",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -570,7 +856,6 @@ cc_binary(
     ],
     copts = compiler_flags,
     deps = [
-        ":base",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
     ],
@@ -585,6 +870,8 @@ cc_test(
     copts = compiler_flags,
     deps = [
         ":agent",
+        ":ghost",
+        ":topology",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
@@ -743,30 +1030,43 @@ cc_binary(
     srcs = [
         "experiments/rocksdb/cfs_orchestrator.cc",
         "experiments/rocksdb/cfs_orchestrator.h",
-        "experiments/rocksdb/clock.h",
-        "experiments/rocksdb/database.cc",
-        "experiments/rocksdb/database.h",
         "experiments/rocksdb/ghost_orchestrator.cc",
         "experiments/rocksdb/ghost_orchestrator.h",
-        "experiments/rocksdb/ingress.cc",
-        "experiments/rocksdb/ingress.h",
-        "experiments/rocksdb/latency.cc",
-        "experiments/rocksdb/latency.h",
         "experiments/rocksdb/main.cc",
-        "experiments/rocksdb/orchestrator.cc",
-        "experiments/rocksdb/orchestrator.h",
-        "experiments/rocksdb/request.h",
     ],
     copts = compiler_flags,
     visibility = ["//experiments/scripts:__pkg__"],
     deps = [
-        ":base",
         ":experiments_shared",
+        ":rocksdb_lib",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/functional:bind_front",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_library(
+    name = "rocksdb_lib",
+    srcs = [
+        "experiments/rocksdb/database.cc",
+        "experiments/rocksdb/ingress.cc",
+        "experiments/rocksdb/latency.cc",
+        "experiments/rocksdb/orchestrator.cc",
+    ],
+    hdrs = [
+        "experiments/rocksdb/clock.h",
+        "experiments/rocksdb/database.h",
+        "experiments/rocksdb/ingress.h",
+        "experiments/rocksdb/latency.h",
+        "experiments/rocksdb/orchestrator.h",
+        "experiments/rocksdb/request.h",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":base",
+        ":experiments_shared",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/random:bit_gen_ref",
-        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@rocksdb",
     ],
@@ -1005,6 +1305,7 @@ cc_test(
     deps = [
         ":agent",
         ":ghost",
+        ":topology",
         "@com_google_benchmark//:benchmark",
         "@com_google_googletest//:gtest",
     ],

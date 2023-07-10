@@ -1,18 +1,12 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/fifo/centralized/fifo_scheduler.h"
+
+#include <memory>
 
 #include "absl/strings/str_format.h"
 
@@ -24,10 +18,12 @@ void FifoScheduler::CpuTimerExpired(const Message& msg) { CHECK(0); }
 
 FifoScheduler::FifoScheduler(Enclave* enclave, CpuList cpulist,
                              std::shared_ptr<TaskAllocator<FifoTask>> allocator,
-                             int32_t global_cpu)
+                             int32_t global_cpu,
+                             absl::Duration preemption_time_slice)
     : BasicDispatchScheduler(enclave, std::move(cpulist), std::move(allocator)),
       global_cpu_(global_cpu),
-      global_channel_(GHOST_MAX_QUEUE_ELEMS, /*node=*/0) {
+      global_channel_(GHOST_MAX_QUEUE_ELEMS, /*node=*/0),
+      preemption_time_slice_(preemption_time_slice) {
   if (!cpus().IsSet(global_cpu_)) {
     Cpu c = cpus().Front();
     CHECK(c.valid());
@@ -51,11 +47,6 @@ bool FifoScheduler::Available(const Cpu& cpu) {
   if (cs->agent) return cs->agent->cpu_avail();
 
   return false;
-}
-
-void FifoScheduler::ValidatePreExitState() {
-  CHECK_EQ(num_tasks_, 0);
-  CHECK_EQ(RunqueueSize(), 0);
 }
 
 void FifoScheduler::DumpAllTasks() {
@@ -128,6 +119,10 @@ void FifoScheduler::TaskRunnable(FifoTask* task, const Message& msg) {
 }
 
 void FifoScheduler::TaskDeparted(FifoTask* task, const Message& msg) {
+  if (task->yielding()) {
+    Unyield(task);
+  }
+
   if (task->oncpu()) {
     CpuState* cs = cpu_state_of(task);
     CHECK_EQ(cs->current, task);
@@ -195,6 +190,17 @@ void FifoScheduler::Yield(FifoTask* task) {
   yielding_tasks_.emplace_back(task);
 }
 
+void FifoScheduler::Unyield(FifoTask* task) {
+  CHECK(task->yielding());
+
+  auto it = std::find(yielding_tasks_.begin(), yielding_tasks_.end(), task);
+  CHECK(it != yielding_tasks_.end());
+  yielding_tasks_.erase(it);
+
+  task->run_state = FifoTask::RunState::kRunnable;
+  Enqueue(task);
+}
+
 void FifoScheduler::Enqueue(FifoTask* task) {
   CHECK_EQ(task->run_state, FifoTask::RunState::kRunnable);
   task->run_state = FifoTask::RunState::kQueued;
@@ -249,7 +255,7 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, const Cpu& cpu) {
 }
 
 void FifoScheduler::GlobalSchedule(const StatusWord& agent_sw,
-                                   StatusWord::BarrierToken agent_sw_last) {
+                                   BarrierToken agent_sw_last) {
   const int global_cpu_id = GetGlobalCPUId();
   CpuList available = topology()->EmptyCpuList();
   CpuList assigned = topology()->EmptyCpuList();
@@ -262,7 +268,12 @@ void FifoScheduler::GlobalSchedule(const StatusWord& agent_sw,
       continue;
     }
 
-    if (cs->current) {
+    if (!Available(cpu)) {
+      // This CPU is running a higher priority sched class, such as CFS.
+      continue;
+    }
+    if (cs->current &&
+        (MonotonicNow() - cs->last_commit) < preemption_time_slice_) {
       // This CPU is currently running a task, so do not schedule a different
       // task on it.
       continue;
@@ -294,7 +305,13 @@ void FifoScheduler::GlobalSchedule(const StatusWord& agent_sw,
     // Assign `next` to run on the CPU at the front of `available`.
     const Cpu& next_cpu = available.Front();
     CpuState* cs = cpu_state(next_cpu);
+
+    if (cs->current) {
+      cs->current->run_state = FifoTask::RunState::kRunnable;
+      Enqueue(cs->current);
+    }
     cs->current = next;
+
     available.Clear(next_cpu);
     assigned.Set(next_cpu);
 
@@ -310,6 +327,10 @@ void FifoScheduler::GlobalSchedule(const StatusWord& agent_sw,
   // Commit on all CPUs with open transactions.
   if (!assigned.Empty()) {
     enclave()->CommitRunRequests(assigned);
+    absl::Time now = MonotonicNow();
+    for (const Cpu& cpu : assigned) {
+      cpu_state(cpu)->last_commit = now;
+    }
   }
   for (const Cpu& next_cpu : assigned) {
     CpuState* cs = cpu_state(next_cpu);
@@ -341,7 +362,7 @@ void FifoScheduler::GlobalSchedule(const StatusWord& agent_sw,
   }
 }
 
-bool FifoScheduler::PickNextGlobalCPU(StatusWord::BarrierToken agent_barrier,
+bool FifoScheduler::PickNextGlobalCPU(BarrierToken agent_barrier,
                                       const Cpu& this_cpu) {
   Cpu target(Cpu::UninitializedType::kUninitialized);
   Cpu global_cpu = topology()->cpu(GetGlobalCPUId());
@@ -415,13 +436,14 @@ found:
   return true;
 }
 
-std::unique_ptr<FifoScheduler> SingleThreadFifoScheduler(Enclave* enclave,
-                                                         CpuList cpulist,
-                                                         int32_t global_cpu) {
+std::unique_ptr<FifoScheduler> SingleThreadFifoScheduler(
+    Enclave* enclave, CpuList cpulist, int32_t global_cpu,
+    absl::Duration preemption_time_slice) {
   auto allocator =
       std::make_shared<SingleThreadMallocTaskAllocator<FifoTask>>();
-  auto scheduler = absl::make_unique<FifoScheduler>(
-      enclave, std::move(cpulist), std::move(allocator), global_cpu);
+  auto scheduler = std::make_unique<FifoScheduler>(
+      enclave, std::move(cpulist), std::move(allocator), global_cpu,
+      preemption_time_slice);
   return scheduler;
 }
 
@@ -437,7 +459,7 @@ void FifoAgent::AgentThread() {
   PeriodicEdge debug_out(absl::Seconds(1));
 
   while (!Finished() || !global_scheduler_->Empty()) {
-    StatusWord::BarrierToken agent_barrier = status_word().barrier();
+    BarrierToken agent_barrier = status_word().barrier();
     // Check if we're assigned as the Global agent.
     if (cpu().id() != global_scheduler_->GetGlobalCPUId()) {
       RunRequest* req = enclave()->GetRunRequest(cpu());

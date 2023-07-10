@@ -27,13 +27,13 @@
  * - and example of how to preempt tasks based on some basic policy.
  *
  * FAQ:
- * - Do we need to request SEND_TASK_LATCHED?  Yes.  (This has the kernel
- *   generate a TASK_LATCHED message when we got on_cpu).  Arguably, if
+ * - Do we need to request SEND_TASK_ON_CPU?  Yes.  (This has the kernel
+ *   generate a TASK_ON_CPU message when we got on_cpu).  Arguably, if
  *   bpf_ghost_run_gtid() returns successfully, our task was latched, and we
- *   could run the contents of handle_latched() in bpf-pnt.  However, we gain
+ *   could run the contents of handle_on_cpu() in bpf-pnt.  However, we gain
  *   two things from the message handler: the cpu_seqnum (used in resched) and
  *   synchronization.  bpf-msg runs with the RQ lock for the task
- *   held.  bpf-pnt does not.  By deferring the work to handle_latched(), we
+ *   held.  bpf-pnt does not.  By deferring the work to handle_on_cpu(), we
  *   don't have to worry about concurrent changes to the task's data structures.
  *
  * - Can we do something smarter with dont_idle?  Yes!  Right now, we just tell
@@ -94,31 +94,49 @@
 
 #include "third_party/bpf/biff_bpf.h"
 #include "third_party/bpf/common.bpf.h"
+#include "third_party/bpf/topology.bpf.h"
 
 #include <asm-generic/errno.h>
 
-/*
- * Part of the ghost UAPI.  vmlinux.h doesn't include #defines, so we need to
- * add it manually.
- */
-#define SEND_TASK_LATCHED (1 << 10)
-
 bool initialized;
 
-/* max_entries is patched at runtime to num_possible_cpus */
+/*
+ * You can't hold bpf spinlocks and make helper calls, which include looking up
+ * map elements.  To use 'intrusive' list struct embedded cpu_data and sw_data
+ * (e.g.  a 'next' index/pointer for a singly-linked list), and to manipulate
+ * those structs while holding a lock, we need to safely access fields by index
+ * without calling bpf_map_lookup_elem().
+ *
+ * We can do so with...  drumroll... another layer of indirection.  (Sort of).
+ * The Array map is a map of a single struct, which contains the entire array
+ * that we want to access.  So once we do a single lookup, we have access to the
+ * entire array.  e.g. lookup(cpu_data, 0), and now we can access cpu[x],
+ * cpu[y], cpu[z], etc.
+ *
+ * The data layout of the Array map is still just an array of structs; we just
+ * have an intermediate struct (e.g. __cpu_arr) to convince the verifier this is
+ * safe.  Userspace still can cast the array map to an array of
+ * biff_bpf_cpu_data[BIFF_MAX_CPUS].
+ */
+struct __cpu_arr {
+	struct biff_bpf_cpu_data e[BIFF_MAX_CPUS];
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct biff_bpf_cpu_data);
+	__type(value, struct __cpu_arr);
 	__uint(map_flags, BPF_F_MMAPABLE);
 } cpu_data SEC(".maps");
 
+struct __sw_arr {
+	struct biff_bpf_sw_data e[BIFF_MAX_GTIDS];
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, BIFF_MAX_GTIDS);
+	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct biff_bpf_sw_data);
+	__type(value, struct __sw_arr);
 	__uint(map_flags, BPF_F_MMAPABLE);
 } sw_data SEC(".maps");
 
@@ -144,23 +162,46 @@ struct {
 	__type(value, struct task_sw_info);
 } sw_lookup SEC(".maps");
 
+/* Helper, from cpu id to per-cpu data blob */
+static struct biff_bpf_cpu_data *cpu_to_pcpu(u32 cpu)
+{
+	struct __cpu_arr *__ca;
+	u32 zero = 0;
+
+	__ca = bpf_map_lookup_elem(&cpu_data, &zero);
+	if (!__ca)
+		return NULL;
+	BPF_MUST_CHECK(cpu);
+	if (cpu >= BIFF_MAX_CPUS)
+		return NULL;
+	return &__ca->e[cpu];
+}
 
 /* Helper, from gtid to per-task sw_data blob */
 static struct biff_bpf_sw_data *gtid_to_swd(u64 gtid)
 {
 	struct task_sw_info *swi;
+	struct __sw_arr *__swa;
+	u32 zero = 0;
+	u32 idx;
 
 	swi = bpf_map_lookup_elem(&sw_lookup, &gtid);
 	if (!swi)
 		return NULL;
-	return bpf_map_lookup_elem(&sw_data, &swi->index);
+	idx = swi->index;
+	if (idx >= BIFF_MAX_GTIDS)
+		return NULL;
+	__swa = bpf_map_lookup_elem(&sw_data, &zero);
+	if (!__swa)
+		return NULL;
+	return &__swa->e[idx];
 }
 
 static void task_started(u64 gtid, int cpu, u64 cpu_seqnum)
 {
 	struct biff_bpf_cpu_data *pcpu;
 
-	pcpu = bpf_map_lookup_elem(&cpu_data, &cpu);
+	pcpu = cpu_to_pcpu(cpu);
 	if (!pcpu)
 		return;
 	pcpu->current = gtid;
@@ -171,7 +212,7 @@ static void task_stopped(int cpu)
 {
 	struct biff_bpf_cpu_data *pcpu;
 
-	pcpu = bpf_map_lookup_elem(&cpu_data, &cpu);
+	pcpu = cpu_to_pcpu(cpu);
 	if (!pcpu)
 		return;
 	pcpu->current = 0;
@@ -181,7 +222,7 @@ static struct biff_bpf_sw_data *get_current(int cpu)
 {
 	struct biff_bpf_cpu_data *pcpu;
 
-	pcpu = bpf_map_lookup_elem(&cpu_data, &cpu);
+	pcpu = cpu_to_pcpu(cpu);
 	if (!pcpu)
 		return NULL;
 	if (!pcpu->current)
@@ -192,12 +233,9 @@ static struct biff_bpf_sw_data *get_current(int cpu)
 /* Forces the cpu to reschedule and eventually call bpf-pnt. */
 static int resched_cpu(int cpu)
 {
-	struct biff_bpf_cpu_data *pcpu;
+	const int flags = RESCHED_GHOST_CLASS | RESCHED_IDLE_CLASS | SET_MUST_RESCHED;
 
-	pcpu = bpf_map_lookup_elem(&cpu_data, &cpu);
-	if (!pcpu)
-		return -1;
-	return bpf_ghost_resched_cpu(cpu, pcpu->cpu_seqnum);
+	return bpf_ghost_resched_cpu2(cpu, flags);
 }
 
 /* Biff POLICY: dumb global fifo.  No locality, etc. */
@@ -236,14 +274,8 @@ static void enqueue_task(u64 gtid, u32 task_barrier)
 		 * on a bpf ring_buffer map to handle it by trying to shove the
 		 * task into the queue again.
 		 */
-		bpf_printk("failed to enqueue %p, err %d\n", gtid, err);
+		bpf_printd("failed to enqueue %p, err %d\n", gtid, err);
 	}
-}
-
-/* Avoid the dreaded "dereference of modified ctx ptr R6 off=3 disallowed" */
-static void __attribute__((noinline)) set_dont_idle(struct bpf_ghost_sched *ctx)
-{
-	ctx->dont_idle = true;
 }
 
 SEC("ghost_sched/pnt")
@@ -285,13 +317,13 @@ int biff_pnt(struct bpf_ghost_sched *ctx)
 		case ENOENT:
 			break;
 		default:
-			bpf_printk("failed to dequeue, err %d\n", err);
+			bpf_printd("failed to dequeue, err %d\n", err);
 		}
 		goto done;
 	}
 
 	err = bpf_ghost_run_gtid(next->gtid, next->task_barrier,
-				 SEND_TASK_LATCHED);
+				 SEND_TASK_ON_CPU);
 	if (err) {
 		/* Three broad classes of error:
 		 * - ignore it
@@ -349,7 +381,7 @@ int biff_pnt(struct bpf_ghost_sched *ctx)
 			 *   where CFS is present, though right now it shouldn't
 			 *   be reachable from bpf-pnt.
 			 */
-			bpf_printk("failed to run %p, err %d\n", next->gtid, err);
+			bpf_printd("failed to run %p, err %d\n", next->gtid, err);
 			enqueue_task(next->gtid, next->task_barrier);
 			break;
 		}
@@ -406,6 +438,7 @@ static void __attribute__((noinline)) handle_new(struct bpf_ghost_msg *msg)
 	swd = gtid_to_swd(gtid);
 	if (!swd)
 		return;
+	swd->parent = new->parent_gtid;
 	swd->ran_until = now;
 	if (new->runnable) {
 		swd->runnable_at = now;
@@ -413,18 +446,18 @@ static void __attribute__((noinline)) handle_new(struct bpf_ghost_msg *msg)
 	}
 }
 
-static void __attribute__((noinline)) handle_latched(struct bpf_ghost_msg *msg)
+static void __attribute__((noinline)) handle_on_cpu(struct bpf_ghost_msg *msg)
 {
-	struct ghost_msg_payload_task_latched *latched = &msg->latched;
+	struct ghost_msg_payload_task_on_cpu *on_cpu = &msg->on_cpu;
 	struct biff_bpf_sw_data *swd;
-	u64 gtid = latched->gtid;
+	u64 gtid = on_cpu->gtid;
 
 	swd = gtid_to_swd(gtid);
 	if (!swd)
 		return;
 	swd->ran_at = bpf_ktime_get_us();
 
-	task_started(gtid, latched->cpu, latched->cpu_seqnum);
+	task_started(gtid, on_cpu->cpu, on_cpu->cpu_seqnum);
 }
 
 static void __attribute__((noinline)) handle_blocked(struct bpf_ghost_msg *msg)
@@ -541,9 +574,40 @@ static void __attribute__((noinline)) handle_cpu_tick(struct bpf_ghost_msg *msg)
 	if (!swd)
 		return;
 
-	/* Arbitrary POLICY: kick anyone off cpu after 50ms */
-	if (bpf_ktime_get_us() - swd->ran_at > 50000)
+	/*
+	 * Arbitrary POLICY: kick anyone off cpu after 50ms, and kick the
+	 * sibling too, just because we can.
+	 */
+	if (bpf_ktime_get_us() - swd->ran_at > 50000) {
 		resched_cpu(cpu);
+		resched_cpu(sibling_of(cpu));
+	}
+}
+
+static void __attribute__((noinline))
+handle_cpu_available(struct bpf_ghost_msg *msg)
+{
+	struct ghost_msg_payload_cpu_available *avail = &msg->cpu_available;
+	struct biff_bpf_cpu_data *pcpu;
+	int cpu = avail->cpu;
+
+	pcpu = cpu_to_pcpu(cpu);
+	if (!pcpu)
+		return;
+	pcpu->available = true;
+}
+
+static void __attribute__((noinline))
+handle_cpu_busy(struct bpf_ghost_msg *msg)
+{
+	struct ghost_msg_payload_cpu_busy *busy = &msg->cpu_busy;
+	struct biff_bpf_cpu_data *pcpu;
+	int cpu = busy->cpu;
+
+	pcpu = cpu_to_pcpu(cpu);
+	if (!pcpu)
+		return;
+	pcpu->available = false;
 }
 
 SEC("ghost_msg/msg_send")
@@ -553,8 +617,8 @@ int biff_msg_send(struct bpf_ghost_msg *msg)
 	case MSG_TASK_NEW:
 		handle_new(msg);
 		break;
-	case MSG_TASK_LATCHED:
-		handle_latched(msg);
+	case MSG_TASK_ON_CPU:
+		handle_on_cpu(msg);
 		break;
 	case MSG_TASK_BLOCKED:
 		handle_blocked(msg);
@@ -580,10 +644,40 @@ int biff_msg_send(struct bpf_ghost_msg *msg)
 	case MSG_CPU_TICK:
 		handle_cpu_tick(msg);
 		break;
+	case MSG_CPU_AVAILABLE:
+		handle_cpu_available(msg);
+		break;
+	case MSG_CPU_BUSY:
+		handle_cpu_busy(msg);
+		break;
 	}
 
 	/* Never send the message to userspace: no one is listening. */
 	return 1;
+}
+
+SEC("ghost_select_rq/select_rq")
+int biff_select_rq(struct bpf_ghost_select_rq *ctx)
+{
+	u64 gtid = ctx->gtid;
+	/* Can't pass ctx->gtid to gtid_to_thread (swd) directly.  (verifier) */
+	struct biff_bpf_sw_data *t = gtid_to_swd(gtid);
+
+	if (!t) {
+		bpf_printd("Got select_rq without a task!");
+		return -1;
+	}
+
+	/*
+	 * POLICY
+	 *
+	 * Not necessarily a good policy.  The combo of skip + picking the
+	 * task_cpu will grab remote cpus RQ locks for remote wakeups.  This is
+	 * just an example of what you can do.
+	 */
+	ctx->skip_ttwu_queue = true;
+
+	return ctx->task_cpu;
 }
 
 char LICENSE[] SEC("license") = "GPL";

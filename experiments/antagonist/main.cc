@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 // The Antagonist program. The antagonist tries to consume as many CPU cycles as
 // possible by spinning.
@@ -34,11 +26,7 @@ ABSL_FLAG(double, work_share, 1.0,
           "equal to 0.0 and less than or equal to 1.0. (default: 1.0)");
 ABSL_FLAG(size_t, num_threads, 8,
           "The number of worker threads to use (default: 8 threads).");
-// It is preferred that the 'cpus' flag be an 'std::vector<int>', but the only
-// vector type that Abseil supports is 'std::vector<std::string>>'.
-ABSL_FLAG(std::vector<std::string>, cpus,
-          std::vector<std::string>({"10", "11", "12", "13", "14", "15", "16",
-                                    "17"}),
+ABSL_FLAG(std::string, cpus, "10-17",
           "The CPUs to affine threads to. Only threads scheduled by CFS are "
           "affined. (default: CPUs 10-17).");
 ABSL_FLAG(absl::Duration, experiment_duration, absl::InfiniteDuration(),
@@ -65,10 +53,8 @@ ghost_test::Orchestrator::Options GetOptions() {
   CHECK_GE(options.work_share, 0.0);
   CHECK_LE(options.work_share, 1.0);
   options.num_threads = absl::GetFlag(FLAGS_num_threads);
-
-  for (const std::string& cpu : absl::GetFlag(FLAGS_cpus)) {
-    options.cpus.push_back(std::stoi(cpu));
-  }
+  options.cpus =
+      ghost::MachineTopology()->ParseCpuStr(absl::GetFlag(FLAGS_cpus));
 
   options.experiment_duration = absl::GetFlag(FLAGS_experiment_duration);
   CHECK_GE(options.experiment_duration, absl::ZeroDuration());
@@ -145,10 +131,11 @@ int main(int argc, char* argv[]) {
   // main thread's affinity mask when they are spawned. Thus, the background
   // threads will automatically be affined to
   // 'ghost_test::Orchestrator::kBackgroundThreadCpu'.
-  CHECK_ZERO(ghost::Ghost::SchedSetAffinity(
-      ghost::Gtid::Current(),
-      ghost::MachineTopology()->ToCpuList(
-          std::vector<int>{ghost_test::Orchestrator::kBackgroundThreadCpu})));
+  CHECK_EQ(ghost::GhostHelper()->SchedSetAffinity(
+               ghost::Gtid::Current(),
+               ghost::MachineTopology()->ToCpuList(std::vector<int>{
+                   ghost_test::Orchestrator::kBackgroundThreadCpu})),
+           0);
 
   absl::ParseCommandLine(argc, argv);
 

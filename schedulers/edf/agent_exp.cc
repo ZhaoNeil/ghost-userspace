@@ -1,18 +1,9 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -35,7 +26,7 @@ namespace ghost {
 
 void ParseGlobalConfig(GlobalConfig* config) {
   CpuList ghost_cpus =
-      ghost::MachineTopology()->ParseCpuStr(absl::GetFlag(FLAGS_ghost_cpus));
+      MachineTopology()->ParseCpuStr(absl::GetFlag(FLAGS_ghost_cpus));
   // One CPU for the spinning global agent and at least one other for running
   // scheduled ghOSt tasks.
   CHECK_GE(ghost_cpus.Size(), 2);
@@ -87,7 +78,7 @@ int main(int argc, char* argv[]) {
   auto uap = new ghost::AgentProcess<ghost::GlobalEdfAgent<ghost::LocalEnclave>,
                                      ghost::GlobalConfig>(config);
 
-  ghost::Ghost::InitCore();
+  ghost::GhostHelper()->InitCore();
 
   printf("Initialization complete, ghOSt active.\n");
   // When `stdout` is directed to a terminal, it is newline-buffered. When

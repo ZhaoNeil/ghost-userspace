@@ -1,20 +1,13 @@
 // Copyright 2022 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/biff/biff_scheduler.h"
 
 #include "absl/strings/str_format.h"
+#include "third_party/bpf/topology.bpf.h"
 #include "bpf/user/agent.h"
 
 namespace ghost {
@@ -27,12 +20,15 @@ BiffScheduler::BiffScheduler(Enclave* enclave, CpuList cpulist,
   bpf_obj_ = biff_bpf__open();
   CHECK_NE(bpf_obj_, nullptr);
 
-  bpf_map__resize(bpf_obj_->maps.cpu_data, libbpf_num_possible_cpus());
-
   bpf_program__set_types(bpf_obj_->progs.biff_pnt,
                          BPF_PROG_TYPE_GHOST_SCHED, BPF_GHOST_SCHED_PNT);
   bpf_program__set_types(bpf_obj_->progs.biff_msg_send, BPF_PROG_TYPE_GHOST_MSG,
                          BPF_GHOST_MSG_SEND);
+  bpf_program__set_types(bpf_obj_->progs.biff_select_rq,
+                         BPF_PROG_TYPE_GHOST_SELECT_RQ, BPF_GHOST_SELECT_RQ);
+
+  bpf_obj_->rodata->enable_bpf_printd = CapHas(CAP_PERFMON);
+  SetBpfTopologyVars(bpf_obj_->rodata, MachineTopology());
 
   CHECK_EQ(biff_bpf__load(bpf_obj_), 0);
 
@@ -40,6 +36,8 @@ BiffScheduler::BiffScheduler(Enclave* enclave, CpuList cpulist,
            0);
   CHECK_EQ(agent_bpf_register(bpf_obj_->progs.biff_msg_send,
                               BPF_GHOST_MSG_SEND), 0);
+  CHECK_EQ(agent_bpf_register(bpf_obj_->progs.biff_select_rq,
+                              BPF_GHOST_SELECT_RQ), 0);
 
   bpf_cpu_data_ = static_cast<struct biff_bpf_cpu_data*>(
       bpf_map__mmap(bpf_obj_->maps.cpu_data));
@@ -57,9 +55,8 @@ BiffScheduler::~BiffScheduler() {
 }
 
 void BiffScheduler::EnclaveReady() {
-  // Biff has no cpu locality, so the remote wakeup is never worth it.
-  enclave()->SetWakeOnWakerCpu(true);
-
+  enclave()->SetDeliverTicks(true);
+  enclave()->SetDeliverCpuAvailability(true);
   WRITE_ONCE(bpf_obj_->bss->initialized, true);
 }
 

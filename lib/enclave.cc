@@ -1,16 +1,8 @@
 // Copyright 2021 Google LLC
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 #include "lib/enclave.h"
 
@@ -24,7 +16,6 @@
 #include "absl/base/attributes.h"
 #include "absl/strings/numbers.h"
 #include "bpf/user/agent.h"
-#include "kernel/ghost_uapi.h"
 #include "lib/agent.h"
 #include "lib/scheduler.h"
 
@@ -164,7 +155,7 @@ void LocalEnclave::ForEachTaskStatusWord(
                              uint32_t idx)>
         l) {
   // TODO: Need to support more than one SW region.
-  StatusWordTable* tbl = Ghost::GetGlobalStatusWordTable();
+  StatusWordTable* tbl = GhostHelper()->GetGlobalStatusWordTable();
   CHECK_NE(tbl, nullptr);
   tbl->ForEachTaskStatusWord(l);
 }
@@ -173,8 +164,8 @@ void LocalEnclave::ForEachTaskStatusWord(
 // file in whichever enclave directory we get.
 // static
 int LocalEnclave::MakeNextEnclave() {
-  int top_ctl =
-      open(absl::StrCat(Ghost::kGhostfsMount, "/ctl").c_str(), O_WRONLY);
+  int top_ctl = open(absl::StrCat(GhostHelper()->kGhostfsMount, "/ctl").c_str(),
+                     O_WRONLY);
   if (top_ctl < 0) {
     return -1;
   }
@@ -195,7 +186,8 @@ int LocalEnclave::MakeNextEnclave() {
   close(top_ctl);
 
   return open(
-      absl::StrCat(Ghost::kGhostfsMount, "/enclave_", id, "/ctl").c_str(),
+      absl::StrCat(GhostHelper()->kGhostfsMount, "/enclave_", id, "/ctl")
+          .c_str(),
       O_RDWR);
 }
 
@@ -205,14 +197,16 @@ int LocalEnclave::MakeNextEnclave() {
 // static
 int LocalEnclave::GetEnclaveDirectory(int ctl_fd) {
   CHECK_GE(ctl_fd, 0);
+  lseek(ctl_fd, 0, SEEK_SET);
   // 20 for the u64 in ascii, 2 for 0x, 1 for \0, 9 in case of a mistake.
   constexpr int kU64InAsciiBytes = 20 + 2 + 1 + 9;
   char buf[kU64InAsciiBytes] = {0};
   CHECK_GT(read(ctl_fd, buf, sizeof(buf)), 0);
   uint64_t id;
   CHECK(absl::SimpleAtoi(buf, &id));
-  return open(absl::StrCat(Ghost::kGhostfsMount, "/enclave_", id).c_str(),
-              O_PATH);
+  return open(
+      absl::StrCat(GhostHelper()->kGhostfsMount, "/enclave_", id).c_str(),
+      O_PATH);
 }
 
 // static
@@ -224,6 +218,16 @@ void LocalEnclave::WriteEnclaveTunable(int dir_fd,
   CHECK_EQ(write(tunable_fd, tunable_value.data(), tunable_value.length()),
            tunable_value.length());
   close(tunable_fd);
+}
+
+// static
+std::string LocalEnclave::ReadEnclaveTunable(int dir_fd,
+                                             absl::string_view tunable_path) {
+  int tunable_fd = openat(dir_fd, std::string(tunable_path).c_str(), O_RDONLY);
+  CHECK_GE(tunable_fd, 0);
+  std::string val = ReadString(tunable_fd);
+  close(tunable_fd);
+  return val;
 }
 
 // static
@@ -334,7 +338,8 @@ void LocalEnclave::DestroyEnclave(int ctl_fd) {
 // static
 void LocalEnclave::DestroyAllEnclaves() {
   std::error_code ec;
-  auto f = std::filesystem::directory_iterator(Ghost::kGhostfsMount, ec);
+  auto f =
+      std::filesystem::directory_iterator(GhostHelper()->kGhostfsMount, ec);
   auto end = std::filesystem::directory_iterator();
   for (/* f */; !ec && f != end; f.increment(ec)) {
     if (std::regex_match(f->path().filename().string(),
@@ -354,9 +359,9 @@ void LocalEnclave::CommonInit() {
   // Bug out if we already have a non-default global enclave.  We shouldn't have
   // more than one enclave per process at a time, at least not until we have
   // fully moved away from default enclaves.
-  CHECK_EQ(Ghost::GetGlobalEnclaveCtlFd(), -1);
-  CHECK_EQ(Ghost::GetGlobalEnclaveDirFd(), -1);
-  Ghost::SetGlobalEnclaveFds(ctl_fd_, dir_fd_);
+  CHECK_EQ(GhostHelper()->GetGlobalEnclaveCtlFd(), -1);
+  CHECK_EQ(GhostHelper()->GetGlobalEnclaveDirFd(), -1);
+  GhostHelper()->SetGlobalEnclaveFds(ctl_fd_, dir_fd_);
 
   CHECK_EQ(GetAbiVersion(), GHOST_VERSION);
 
@@ -369,7 +374,8 @@ void LocalEnclave::CommonInit() {
   close(data_fd);
   CHECK_NE(data_region_, MAP_FAILED);
 
-  Ghost::SetGlobalStatusWordTable(new LocalStatusWordTable(dir_fd_, 0, 0));
+  GhostHelper()->SetGlobalStatusWordTable(
+      new LocalStatusWordTable(dir_fd_, /*id=*/0, config_.numa_node_));
 }
 
 // Initialize a CpuRep for each cpu in enclaves_cpus_ (aka, cpus()).
@@ -480,9 +486,9 @@ LocalEnclave::~LocalEnclave() {
   close(dir_fd_);
   // agent_test has some cases where it creates new enclaves within the same
   // process, so reset the global enclave ghost variables
-  Ghost::SetGlobalEnclaveFds(-1, -1);
-  delete Ghost::GetGlobalStatusWordTable();
-  Ghost::SetGlobalStatusWordTable(nullptr);
+  GhostHelper()->SetGlobalEnclaveFds(-1, -1);
+  delete GhostHelper()->GetGlobalStatusWordTable();
+  GhostHelper()->SetGlobalStatusWordTable(nullptr);
 }
 
 void LocalEnclave::InsertBpfPrograms() {
@@ -506,7 +512,7 @@ bool LocalEnclave::CommitRunRequests(const CpuList& cpu_list) {
 
 void LocalEnclave::SubmitRunRequests(const CpuList& cpu_list) {
   cpu_set_t cpus = topology()->ToCpuSet(cpu_list);
-  CHECK_EQ(Ghost::Commit(&cpus), 0);
+  CHECK_EQ(GhostHelper()->Commit(cpus), 0);
 }
 
 bool LocalEnclave::CommitSyncRequests(const CpuList& cpu_list) {
@@ -536,7 +542,7 @@ bool LocalEnclave::CommitSyncRequests(const CpuList& cpu_list) {
 
 bool LocalEnclave::SubmitSyncRequests(const CpuList& cpu_list) {
   cpu_set_t cpus = topology()->ToCpuSet(cpu_list);
-  int ret = Ghost::SyncCommit(&cpus);
+  int ret = GhostHelper()->SyncCommit(cpus);
   CHECK(ret == 0 || ret == 1);
   return ret;
 }
@@ -560,7 +566,7 @@ void LocalEnclave::SubmitRunRequest(RunRequest* req) {
                req->target().describe(), req->target_barrier());
 
   if (req->open()) {
-    CHECK_EQ(Ghost::Commit(req->cpu().id()), 0);
+    CHECK_EQ(GhostHelper()->Commit(req->cpu()), 0);
   } else {
     // Request already picked up by target CPU for commit.
   }
@@ -569,7 +575,7 @@ void LocalEnclave::SubmitRunRequest(RunRequest* req) {
 bool LocalEnclave::CompleteRunRequest(RunRequest* req) {
   // If request was picked up asynchronously then wait for the commit.
   //
-  // N.B. we must do this even if we call Ghost::Commit() because the
+  // N.B. we must do this even if we call GhostHelper()->Commit() because the
   // the request could be committed asynchronously even in that case.
   while (!req->committed()) {
     Pause();
@@ -596,7 +602,7 @@ bool LocalEnclave::CompleteRunRequest(RunRequest* req) {
     // target CPU's agent is exiting
     case GHOST_TXN_NO_AGENT:
       // If we ever shrink enclaves at runtime, we'll need to modify this check.
-      if (agent_online_fd_ != -1) {
+      if (IsOnline()) {
         GHOST_ERROR("TXN failed with NO_AGENT, but we are still online!");
       }
       break;
@@ -607,6 +613,10 @@ bool LocalEnclave::CompleteRunRequest(RunRequest* req) {
 
     // txn poisoned due to sync-commit failure.
     case GHOST_TXN_POISONED:
+      break;
+
+    // txn aborted.
+    case GHOST_TXN_ABORTED:
       break;
 
     // target already on cpu
@@ -624,12 +634,12 @@ bool LocalEnclave::CompleteRunRequest(RunRequest* req) {
   return false;
 }
 
-void LocalEnclave::LocalYieldRunRequest(
-    const RunRequest* req, const StatusWord::BarrierToken agent_barrier,
-    const int flags) {
+void LocalEnclave::LocalYieldRunRequest(const RunRequest* req,
+                                        BarrierToken agent_barrier, int flags) {
   DCHECK_EQ(sched_getcpu(), req->cpu().id());
-  int error = Ghost::Run(Gtid(0), agent_barrier, StatusWord::NullBarrierToken(),
-                         req->cpu().id(), flags);
+  int error =
+      GhostHelper()->Run(Gtid(0), agent_barrier, StatusWord::NullBarrierToken(),
+                         req->cpu(), flags);
   // Sanity check why we failed.
   //   ESTALE: old barrier / missed message
   //   ENODEV: enclave is being destroyed (a kernfs ioctl errno)
@@ -640,10 +650,10 @@ void LocalEnclave::LocalYieldRunRequest(
 
 bool LocalEnclave::PingRunRequest(const RunRequest* req) {
   const int run_flags = 0;
-  int rc = Ghost::Run(Gtid(GHOST_AGENT_GTID),
-                      StatusWord::NullBarrierToken(),  // agent_barrier
-                      StatusWord::NullBarrierToken(),  // task_barrier
-                      req->cpu().id(), run_flags);
+  int rc = GhostHelper()->Run(Gtid(GHOST_AGENT_GTID),
+                              StatusWord::NullBarrierToken(),  // agent_barrier
+                              StatusWord::NullBarrierToken(),  // task_barrier
+                              req->cpu(), run_flags);
   return rc == 0;
 }
 
@@ -664,6 +674,8 @@ void LocalEnclave::AdvertiseOnline() {
   // there is an agent capable of scheduling this enclave.
   agent_online_fd_ = openat(dir_fd_, "agent_online", O_RDWR);
   CHECK_GE(agent_online_fd_, 0);
+
+  Enclave::AdvertiseOnline();
 }
 
 // We have a bunch of open FDs for enclave resources, such as agent_online and
@@ -674,6 +686,13 @@ void LocalEnclave::AdvertiseOnline() {
 // Make sure this is idempotent: TerminateAgentTasks() calls this as an
 // optimization, but ~LocalEnclave does too to ensure destruction.
 void LocalEnclave::PrepareToExit() {
+  Enclave::PrepareToExit();
+  // Relying on close(), at least for agent_online, to provide a write memory
+  // barrier after PrepareToExit, such that any reader who sees agent_online
+  // closed will see IsOnline as false (which was set in PrepareToExit).
+  //
+  // An external observer can see the enclave file agent_online == 0 (read() on
+  // agent_online), then contact the Agent, which must see IsOnline == false.
   close(agent_online_fd_);
   agent_online_fd_ = -1;
   agent_bpf_destroy();
